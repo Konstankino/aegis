@@ -164,6 +164,7 @@ made executable.
 | `aegis-intent` *(new, §11)* | Signed goal/intent envelope bound per execution cycle + goal-drift | ASI01 | ● |
 | `aegis-sandbox` *(new, §11)* | Isolated, non-root, ephemeral code-execution environment | ASI05 | ● |
 | `aegis-killswitch` *(new, §11)* | Emergency revocation + quarantine + recovery/reintegration | ASI04, ASI08, ASI10 | ● |
+| `aegis-honeypot` *(new, §11)* | Deception tripwires — decoy probes + planted canary tokens → quarantine | ASI05, ASI08 | ●/◐ |
 
 ### 2.3 The trust vocabulary (`aegis-core`)
 
@@ -672,14 +673,14 @@ Honest note: the ASI list skews more **◐ Reduce / ○ Process** than the LLM l
 risks include *emergent behavioral* phenomena (rogue agents, cascading failures, human persuasion)
 that deterministic code cannot fully prevent. Aegis's value stays where it always was — bounding
 the **consequence** so that even a hijacked or rogue agent breaks nothing important — plus new
-deterministic controls (crypto inter-agent auth, per-agent identity, kill-switch, sandbox) that
-contain the new surfaces. Many ASI entries overlap the LLM list (e.g. ASI02↔LLM03/06,
+deterministic controls (crypto inter-agent auth, per-agent identity, kill-switch, sandbox, deception
+tripwires) that contain the new surfaces. Many ASI entries overlap the LLM list (e.g. ASI02↔LLM03/06,
 ASI05↔LLM05/01, ASI06↔LLM05/09); the LLM-side controls already do double duty, and this section
 adds only the agentic deltas.
 
 ### 11.1 New Aegis components (the adaptation)
 
-Five new crates augment the §2.2 workspace:
+Six new crates augment the §2.2 workspace:
 
 - **`aegis-mesh`** — secure inter-agent communication: mutual auth (mTLS + per-agent PKI), message
   signing (payload+context hash) + intent-diffing, anti-replay (nonces/session-ids/timestamps tied
@@ -701,6 +702,19 @@ Five new crates augment the §2.2 workspace:
 - **`aegis-killswitch`** — emergency revocation: instantly disable a specific tool, prompt, agent
   connection, or agent across all deployments; quarantine suspicious agents; require fresh
   attestation + human approval before reintegration. *Primary for ASI08/ASI10; supports ASI04.*
+- **`aegis-honeypot`** — deception tripwires. **Decoys** are patterns a legitimate flow would never
+  touch (probe paths, the cloud metadata IP `169.254.169.254`, credential-file names, sentinel
+  command markers), matched at policy time (`/sandbox/validate`) *before* execution. **Canaries** are
+  unique tokens planted out-of-band (a fake secret in the ephemeral working dir, a seeded memory
+  chunk) whose appearance in outbound content — a `/mediate` tool-call argument or an egress URL —
+  is proof data was read and is being exfiltrated. The crate owns only deterministic **detection**
+  (case-insensitive substring matching, no I/O, no policy decision of its own); the gate orchestrates
+  the response, so a hit is escalated at the *agent* level — an immutable `EntryKind::Tripwire`
+  ledger entry **+ quarantine via `aegis-killswitch`** — rather than swallowed as a routine `Deny`,
+  and the base containment (the sandbox/egress `Deny`) is never weakened. An empty set is inert (zero
+  false positives until decoys/canaries are configured); each project ships its own
+  `policies/honeypots.json` plus a unique per-deployment runtime canary (`AEGIS_CANARY`). *Primary
+  for ASI05/ASI08; supports ASI10.*
 
 Existing crates also gain agentic extensions: **broker** adds semantic/identity tool validation
 (fully-qualified names + version pins, fail-closed on ambiguity) and blast-radius guardrails
@@ -751,8 +765,11 @@ injection, unsafe deserialization, `eval()` in memory, multi-tool chain, unverif
 installs, lockfile poisoning). *Existing:* output (● no auto-exec, shell/path escaping), broker
 (● open-ended tools banned, generation-vs-execution gate, ban eval), egress (sandbox egress), supply
 (◐ package/lockfile pinning). *Adaptation:* **aegis-sandbox** — non-root, ephemeral,
-network/syscall-limited exec with a dedicated working dir. *Tier:* ● (consequence); bad-code
-generation ◐/○.
+network/syscall-limited exec with a dedicated working dir; **aegis-honeypot** plants decoy credential
+files + a metadata-IP tripwire in that working dir, so generated code that probes for an escape
+(reads `.aws/credentials`, curls `169.254.169.254`) trips a **quarantine before it can act** —
+turning a blind RCE attempt into a high-confidence detection instead of a silent deny. *Tier:* ●
+(consequence); bad-code generation ◐/○.
 
 **ASI06 Memory & Context Poisoning** — *Risk:* persistent corruption of stored/retrievable context
 (RAG/embedding poisoning, shared-memory poisoning, long-term drift, context-window manipulation,
@@ -775,7 +792,9 @@ system-wide harm (fan-out, cross-tenant spread, feedback loops, auto-deployment 
 drift). *Existing:* meter (● circuit breakers + loop detection), broker (◐ planner↔executor
 separation, human gates), ledger (◐ non-repudiation/lineage), egress/sandbox (contain propagation).
 *Adaptation:* blast-radius guardrails across meter+broker+mesh (quotas, progress caps, fan-out caps,
-rate-limit fast-spreading commands); **aegis-killswitch** emergency revocation; **digital-twin
+rate-limit fast-spreading commands); **aegis-killswitch** emergency revocation; **aegis-honeypot**
+canary tokens whose appearance in outbound content trips an immediate quarantine — cutting a
+compromised agent out of the mesh *before* a leak or a hijacked command cascades; **digital-twin
 replay** as a pre-deployment gate in redteam; drift detection in ledger. *Tier:* ● (breakers/
 kill-switch); speed-vs-human ○.
 
@@ -808,10 +827,10 @@ attestation; keys never directly available to agents (orchestrator/HSM mediates 
 | ASI02 Tool Misuse & Exploitation | broker, egress, meter, supply, output | ● |
 | ASI03 Identity & Privilege Abuse | identity, broker, mesh, ledger | ● |
 | ASI04 Agentic Supply Chain | supply, killswitch, mesh | ● |
-| ASI05 Unexpected Code Execution (RCE) | sandbox, output, broker, egress, supply | ● |
+| ASI05 Unexpected Code Execution (RCE) | sandbox, honeypot, output, broker, egress, supply | ● |
 | ASI06 Memory & Context Poisoning | retrieval, ledger, redact | ●/◐ |
 | ASI07 Insecure Inter-Agent Communication | mesh, ingress | ●/◐ |
-| ASI08 Cascading Failures | meter, killswitch, broker, ledger, redteam | ●/○ |
+| ASI08 Cascading Failures | meter, killswitch, honeypot, broker, ledger, redteam | ●/○ |
 | ASI09 Human-Agent Trust Exploitation | broker, output, ledger | ●/◐/○ |
 | ASI10 Rogue Agents | broker, identity, ledger, killswitch, sandbox | ●/◐/○ |
 
