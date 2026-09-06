@@ -39,7 +39,10 @@ fn show(label: &str, decision: &Decision) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let broker = Broker::from_sources(&policy("tools.example.json"), &policy("broker.example.cedar"))?;
+    let broker = Broker::from_sources(
+        &policy("tools.example.json"),
+        &policy("broker.example.cedar"),
+    )?;
     println!(
         "Loaded broker: {} tools, {} Cedar policies\n",
         broker.registry().len(),

@@ -120,7 +120,8 @@ pub async fn load_honeypots_configured() -> aegis_honeypot::Honeypots {
             if !bucket.is_empty() {
                 let prefix = std::env::var("AEGIS_POLICY_S3_PREFIX")
                     .unwrap_or_else(|_| "policies".to_string());
-                if let Some(src) = crate::s3::load_text_opt(&bucket, &prefix, "honeypots.json").await
+                if let Some(src) =
+                    crate::s3::load_text_opt(&bucket, &prefix, "honeypots.json").await
                 {
                     return aegis_honeypot::Honeypots::from_json(&src).unwrap_or_default();
                 }
