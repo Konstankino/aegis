@@ -1,0 +1,205 @@
+{
+  "Comment": "Aegis agent orchestration — a Step Functions STARTING-POINT TREE covering all core state types (Pass, Task, Choice, Map, Parallel, Wait, Succeed, Fail) and patterns (Retry, Catch, fan-out via Map, human-in-the-loop via .waitForTaskToken). Architecture A (§1.3): Step Functions owns durable orchestration; the Aegis broker decides allow | human_approve | deny; a fooled model reaches nothing. Placeholders ${agent_lambda_arn} and ${approval_queue_url} are injected by Terraform.",
+  "StartAt": "Initialize",
+  "States": {
+    "Initialize": {
+      "Type": "Pass",
+      "Comment": "Pass — seed run context. $$.Execution.Name is the durable run id (Architecture A: SF owns 'how far did we get?').",
+      "Parameters": {
+        "run_id.$": "$$.Execution.Name",
+        "tool_calls.$": "$.tool_calls"
+      },
+      "Next": "FanOutToolCalls"
+    },
+
+    "FanOutToolCalls": {
+      "Type": "Map",
+      "Comment": "Map — FAN-OUT (span-out): mediate every proposed tool call as an independent branch, then fan-in. INLINE mode so .waitForTaskToken works inside the iterator.",
+      "ItemsPath": "$.tool_calls",
+      "MaxConcurrency": 5,
+      "ItemSelector": {
+        "run_id.$": "$.run_id",
+        "call.$": "$$.Map.Item.Value"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "INLINE" },
+        "StartAt": "Mediate",
+        "States": {
+          "Mediate": {
+            "Type": "Task",
+            "Comment": "Task — invoke the Aegis agent Lambda. The broker returns allow | human_approve | deny; the model's output is only a request.",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${agent_lambda_arn}",
+              "Payload.$": "$.call"
+            },
+            "ResultSelector": {
+              "decision.$": "$.Payload.decision",
+              "capability.$": "$.Payload.capability",
+              "toolCall.$": "$.Payload.tool_call"
+            },
+            "ResultPath": "$.mediation",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.TooManyRequestsException",
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 1,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.error",
+                "Next": "MediateFailed"
+              }
+            ],
+            "Next": "DecisionChoice"
+          },
+
+          "DecisionChoice": {
+            "Type": "Choice",
+            "Comment": "Choice — branch on the broker's deterministic decision.",
+            "Choices": [
+              {
+                "Variable": "$.mediation.decision",
+                "StringEquals": "allow",
+                "Next": "ExecuteTool"
+              },
+              {
+                "Variable": "$.mediation.decision",
+                "StringEquals": "human_approve",
+                "Next": "RequestApproval"
+              }
+            ],
+            "Default": "Denied"
+          },
+
+          "ExecuteTool": {
+            "Type": "Pass",
+            "Comment": "Pass — stand-in for running the tool the broker allowed (low/reversible).",
+            "Result": { "status": "executed" },
+            "ResultPath": "$.outcome",
+            "Next": "ItemDone"
+          },
+
+          "RequestApproval": {
+            "Type": "Task",
+            "Comment": "Task .waitForTaskToken — HUMAN-IN-THE-LOOP. The lethal trifecta (or an irreversible effect) pauses here durably. The token is sent to SQS; a human (or the approver Lambda) calls SendTaskSuccess to resume.",
+            "Resource": "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
+            "TimeoutSeconds": 3600,
+            "Parameters": {
+              "QueueUrl": "${approval_queue_url}",
+              "MessageBody": {
+                "taskToken.$": "$$.Task.Token",
+                "toolCall.$": "$.mediation.toolCall",
+                "capability.$": "$.mediation.capability",
+                "executionArn.$": "$$.Execution.Id"
+              }
+            },
+            "ResultPath": "$.approval",
+            "Catch": [
+              {
+                "ErrorEquals": ["States.Timeout", "States.TaskFailed"],
+                "ResultPath": "$.error",
+                "Next": "Denied"
+              }
+            ],
+            "Next": "ApprovedExecute"
+          },
+
+          "ApprovedExecute": {
+            "Type": "Pass",
+            "Comment": "Pass — a human approved the high-consequence action; run it now.",
+            "Result": { "status": "executed_after_approval" },
+            "ResultPath": "$.outcome",
+            "Next": "ItemDone"
+          },
+
+          "Denied": {
+            "Type": "Pass",
+            "Comment": "Pass — broker denied, or approval timed out / was rejected. Record and move on.",
+            "Result": { "status": "denied" },
+            "ResultPath": "$.outcome",
+            "Next": "ItemDone"
+          },
+
+          "MediateFailed": {
+            "Type": "Pass",
+            "Comment": "Pass — mediation itself errored after retries. Fail closed for this item.",
+            "Result": { "status": "mediation_error" },
+            "ResultPath": "$.outcome",
+            "Next": "ItemDone"
+          },
+
+          "ItemDone": {
+            "Type": "Succeed",
+            "Comment": "Succeed — this iterator item is complete."
+          }
+        }
+      },
+      "ResultPath": "$.results",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "OrchestrationFailed"
+        }
+      ],
+      "Next": "PostProcess"
+    },
+
+    "PostProcess": {
+      "Type": "Parallel",
+      "Comment": "Parallel — independent post-processing branches run concurrently.",
+      "Branches": [
+        {
+          "StartAt": "Audit",
+          "States": {
+            "Audit": {
+              "Type": "Pass",
+              "Comment": "Pass — would append the decisions to the aegis-ledger (immutable audit).",
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "Summarize",
+          "States": {
+            "Summarize": {
+              "Type": "Pass",
+              "Comment": "Pass — summarize the fan-out decisions for the caller.",
+              "End": true
+            }
+          }
+        }
+      ],
+      "ResultPath": "$.postProcess",
+      "Next": "SettleWait"
+    },
+
+    "SettleWait": {
+      "Type": "Wait",
+      "Comment": "Wait — a timed pause (e.g., let an eventually-consistent write settle).",
+      "Seconds": 1,
+      "Next": "Done"
+    },
+
+    "Done": {
+      "Type": "Succeed",
+      "Comment": "Succeed — orchestration complete."
+    },
+
+    "OrchestrationFailed": {
+      "Type": "Fail",
+      "Comment": "Fail — terminal failure if the fan-out itself fails unrecoverably.",
+      "Error": "OrchestrationError",
+      "Cause": "One or more tool-call mediations failed unrecoverably."
+    }
+  }
+}

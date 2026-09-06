@@ -1,0 +1,14 @@
+# Aegis egress firewall — allowlist STARTER (empty = default-deny).
+#
+# With no hosts/suffixes below, EVERY outbound destination is denied. Add only the hosts your
+# agent must reach. A populated reference lives in `egress-allowlist.example.toml`; copy it in:
+#
+#     cp egress-allowlist.example.toml egress-allowlist.toml
+#
+# HTTPS-only is the default; every query parameter not named in [permitted_params] is stripped.
+
+hosts    = []
+suffixes = []
+schemes  = ["https"]
+
+[permitted_params]

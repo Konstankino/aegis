@@ -1,0 +1,10 @@
+[package]
+name = "aegis-killswitch"
+description = "Aegis emergency revocation + quarantine + gated reintegration (ASI08/ASI10)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }

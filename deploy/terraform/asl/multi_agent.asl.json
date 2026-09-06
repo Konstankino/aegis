@@ -1,0 +1,117 @@
+{
+  "Comment": "Aegis multi-agent stack: a supervisor decomposes the request into sub-tasks, then Step Functions fans out (Map) to a worker agent per sub-task. Each worker runs its own LLM+tool loop, mediates every tool call through the Aegis gate, and pauses on .waitForTaskToken for human approval independently. Placeholders ${supervisor_lambda_arn}, ${worker_lambda_arn}, ${approval_queue_url} are injected by Terraform.",
+  "StartAt": "Init",
+  "States": {
+    "Init": {
+      "Type": "Pass",
+      "Parameters": { "thread_id.$": "$.thread_id", "input.$": "$.input" },
+      "Next": "Supervise"
+    },
+
+    "Supervise": {
+      "Type": "Task",
+      "Comment": "Planner: decompose the request into worker sub-tasks (calls no tools).",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "${supervisor_lambda_arn}", "Payload.$": "$" },
+      "ResultSelector": { "subtasks.$": "$.Payload.subtasks" },
+      "ResultPath": "$.plan",
+      "Retry": [{ "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 1, "MaxAttempts": 2, "BackoffRate": 2.0 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }],
+      "Next": "FanOut"
+    },
+
+    "FanOut": {
+      "Type": "Map",
+      "Comment": "FAN-OUT: one worker per sub-task, each independently gated + approvable.",
+      "ItemsPath": "$.plan.subtasks",
+      "MaxConcurrency": 5,
+      "ItemSelector": {
+        "thread_id.$": "$$.Map.Item.Value.thread_id",
+        "task.$": "$$.Map.Item.Value.task",
+        "worker_role.$": "$$.Map.Item.Value.worker_role"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "INLINE" },
+        "StartAt": "WorkerInit",
+        "States": {
+          "WorkerInit": {
+            "Type": "Pass",
+            "Comment": "Map the sub-task into the worker's first-turn input.",
+            "Parameters": { "thread_id.$": "$.thread_id", "input.$": "$.task", "worker_role.$": "$.worker_role" },
+            "Next": "WorkerTurn"
+          },
+          "WorkerTurn": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": { "FunctionName": "${worker_lambda_arn}", "Payload.$": "$" },
+            "ResultSelector": { "status.$": "$.Payload.status", "payload.$": "$.Payload" },
+            "ResultPath": "$.turn",
+            "Retry": [
+              {
+                "ErrorEquals": ["Lambda.TooManyRequestsException", "Lambda.ServiceException", "States.TaskFailed"],
+                "IntervalSeconds": 1,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "WorkerFailed" }],
+            "Next": "WorkerDecide"
+          },
+          "WorkerDecide": {
+            "Type": "Choice",
+            "Choices": [
+              { "Variable": "$.turn.status", "StringEquals": "done", "Next": "WorkerDone" },
+              { "Variable": "$.turn.status", "StringEquals": "needs_approval", "Next": "WorkerApproval" }
+            ],
+            "Default": "WorkerFailed"
+          },
+          "WorkerApproval": {
+            "Type": "Task",
+            "Comment": "Per-worker human approval pause.",
+            "Resource": "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
+            "TimeoutSeconds": 3600,
+            "Parameters": {
+              "QueueUrl": "${approval_queue_url}",
+              "MessageBody": {
+                "taskToken.$": "$$.Task.Token",
+                "thread_id.$": "$.thread_id",
+                "pending.$": "$.turn.payload.pending"
+              }
+            },
+            "ResultPath": "$.approval",
+            "Catch": [{ "ErrorEquals": ["States.Timeout", "States.TaskFailed"], "ResultPath": "$.error", "Next": "WorkerFailed" }],
+            "Next": "WorkerResume"
+          },
+          "WorkerResume": {
+            "Type": "Pass",
+            "Parameters": { "thread_id.$": "$.thread_id", "resume": true, "pending.$": "$.turn.payload.pending" },
+            "Next": "WorkerTurn"
+          },
+          "WorkerDone": {
+            "Type": "Pass",
+            "Parameters": { "worker_role.$": "$.worker_role", "status": "done", "answer.$": "$.turn.payload.answer" },
+            "End": true
+          },
+          "WorkerFailed": {
+            "Type": "Pass",
+            "Parameters": { "worker_role.$": "$.worker_role", "status": "failed" },
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.results",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }],
+      "Next": "Aggregate"
+    },
+
+    "Aggregate": {
+      "Type": "Pass",
+      "Comment": "Combine the workers' answers for the caller.",
+      "Parameters": { "status": "done", "thread_id.$": "$.thread_id", "results.$": "$.results" },
+      "Next": "Done"
+    },
+
+    "Done": { "Type": "Succeed" },
+    "Failed": { "Type": "Fail", "Error": "OrchestrationError", "Cause": "Supervisor or a worker failed." }
+  }
+}

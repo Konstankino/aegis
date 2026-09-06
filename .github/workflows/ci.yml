@@ -1,0 +1,48 @@
+name: aegis-ci
+
+# Phase 3 (§5): validation as a gate. Nothing ships on a static benchmark alone — the adaptive
+# red-team suite must contain every attack, and the deterministic checks must all pass.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      # The release gate: exits non-zero if any adaptive attack breaches a control.
+      - name: Red-team gate
+        run: cargo run --release -p aegis-redteam
+
+  # The extension also builds with its optional features (s3 fetch, otel export).
+  build-features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build extension (s3 + otel)
+        run: cargo build -p aegis-extension --features s3,otel

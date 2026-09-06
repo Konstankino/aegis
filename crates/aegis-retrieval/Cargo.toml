@@ -1,0 +1,13 @@
+[package]
+name = "aegis-retrieval"
+description = "Aegis retrieval + vector authorization guard: authz-in-query, trust-tier segregation (LLM09/05/02)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aegis-core = { workspace = true }
+aegis-ingress = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

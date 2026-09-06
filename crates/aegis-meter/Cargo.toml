@@ -1,0 +1,11 @@
+[package]
+name = "aegis-meter"
+description = "Aegis token-aware cost governor + agentic circuit breakers (unbounded consumption, LLM06)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aegis-core = { workspace = true }
+serde = { workspace = true }

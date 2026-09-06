@@ -1,0 +1,14 @@
+region = "us-east-1"
+
+# Egress containment + observability (optional; same as the single-agent stack).
+# enable_vpc               = true
+# otel_collector_layer_arn = "arn:aws:lambda:us-east-1:901920570463:layer:aws-otel-collector-arm64-ver-0-115-0:1"
+
+# One multi-agent stack per project. The supervisor decomposes each request and fans out to the
+# named worker roles; every worker mediates its tool calls through Aegis and can pause for a human.
+projects = {
+  "research-desk" = {
+    policy_dir   = "../../../../policies" # reuse the repo's example policies to start
+    worker_roles = ["researcher", "writer"]
+  }
+}

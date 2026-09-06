@@ -1,0 +1,24 @@
+# Copy to terraform.tfvars and adjust. All values are optional (defaults shown).
+
+region         = "us-east-1"
+project_name   = "aegis-demo"
+architecture   = "arm64"      # must match your cargo-lambda cross-compile target ("arm64" | "x86_64")
+python_runtime = "python3.12"
+
+# Put the agent Lambda in a private, no-default-route subnet with closed-egress SG so the
+# egress-containment posture is real. Set false for a faster deploy without networking.
+enable_vpc = true
+
+# Invoke the function during `apply` and print the Aegis decision trace as an output.
+run_demo = true
+
+# Deploy the auto-approver Lambda so the Step Functions demo resumes waitForTaskToken pauses
+# automatically. Set false to approve manually (the task token lands in the approval SQS queue).
+auto_approve = true
+
+# Attach an OpenTelemetry (ADOT) collector Lambda layer to export OTLP traces + metrics to
+# X-Ray + CloudWatch. Leave empty to run with structured logs only. Find the ARN for your
+# region+arch at https://aws-otel.github.io/docs/getting-started/lambda
+# otel_collector_layer_arn = "arn:aws:lambda:us-east-1:901920570463:layer:aws-otel-collector-arm64-ver-0-115-0:1"
+
+log_retention_days = 14

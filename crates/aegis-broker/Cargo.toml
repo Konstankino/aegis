@@ -1,0 +1,15 @@
+[package]
+name = "aegis-broker"
+description = "Aegis capability broker: deterministic tool-call mediation with a Cedar policy core."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aegis-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+cedar-policy = { workspace = true }
+jsonschema = { workspace = true }

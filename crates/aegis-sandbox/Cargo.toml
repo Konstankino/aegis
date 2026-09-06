@@ -1,0 +1,10 @@
+[package]
+name = "aegis-sandbox"
+description = "Aegis isolated code-execution policy: non-root, ephemeral, network-restricted, gate-before-exec (ASI05)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }

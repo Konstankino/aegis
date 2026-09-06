@@ -1,0 +1,92 @@
+# Aegis — deterministic Rust guardrail plane (OWASP GenAI/LLM & Agentic Top 10, 2026).
+# Phase 0: the consequence-side backbone (broker · output · egress) on aegis-core.
+# See ../architecture-considerations.md §5 for the roadmap and "done when" criteria.
+[workspace]
+resolver = "2"
+members = [
+    "crates/aegis-core",
+    "crates/aegis-broker",
+    "crates/aegis-output",
+    "crates/aegis-egress",
+    "crates/aegis-ingress",
+    "crates/aegis-meter",
+    "crates/aegis-ledger",
+    "crates/aegis-retrieval",
+    "crates/aegis-supply",
+    "crates/aegis-redact",
+    "crates/aegis-mesh",
+    "crates/aegis-identity",
+    "crates/aegis-intent",
+    "crates/aegis-sandbox",
+    "crates/aegis-killswitch",
+    "crates/aegis-honeypot",
+    "crates/aegis-redteam",
+    "crates/aegis-extension",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.96"
+
+# Versions are pinned and verified (architecture-considerations.md §1.5/§9 caution:
+# concepts are stable but APIs drift between releases — pin and verify).
+[workspace.dependencies]
+aegis-core = { path = "crates/aegis-core" }
+aegis-broker = { path = "crates/aegis-broker" }
+aegis-output = { path = "crates/aegis-output" }
+aegis-egress = { path = "crates/aegis-egress" }
+aegis-ingress = { path = "crates/aegis-ingress" }
+aegis-meter = { path = "crates/aegis-meter" }
+aegis-ledger = { path = "crates/aegis-ledger" }
+aegis-retrieval = { path = "crates/aegis-retrieval" }
+aegis-supply = { path = "crates/aegis-supply" }
+aegis-redact = { path = "crates/aegis-redact" }
+aegis-mesh = { path = "crates/aegis-mesh" }
+aegis-identity = { path = "crates/aegis-identity" }
+aegis-intent = { path = "crates/aegis-intent" }
+aegis-sandbox = { path = "crates/aegis-sandbox" }
+aegis-killswitch = { path = "crates/aegis-killswitch" }
+aegis-honeypot = { path = "crates/aegis-honeypot" }
+
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+sha2 = "0.10"
+unicode-normalization = "0.1.25"
+regex = "1.13.1"
+ed25519-dalek = "2"
+cedar-policy = "4.12.0"
+jsonschema = "0.52.1"
+url = "2.5.8"
+percent-encoding = "2.3.2"
+axum = "0.8.9"
+tower = "0.5.3"
+hyper = { version = "1.11.1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+tokio = { version = "1.53.1", features = ["full"] }
+toml = "1.1.4"
+lambda-extension = "1.1.0"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tower-http = { version = "0.7.1", features = ["trace"] }
+aws-config = { version = "1.11.0", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.144.0"
+# OpenTelemetry (OTLP export), used behind the extension's `otel` feature.
+opentelemetry = "0.32.0"
+opentelemetry_sdk = { version = "0.32.1", features = ["metrics", "rt-tokio"] }
+# gRPC/tonic transport (plaintext localhost, pure-Rust — no OpenSSL, cross-compiles cleanly for
+# Lambda). default-features=false drops the reqwest/native-TLS HTTP default.
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = [
+    "grpc-tonic",
+    "trace",
+    "metrics",
+] }
+tracing-opentelemetry = "0.33.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

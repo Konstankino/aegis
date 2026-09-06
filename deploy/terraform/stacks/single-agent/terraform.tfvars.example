@@ -1,0 +1,22 @@
+region = "us-east-1"
+
+# Run agents in a shared no-default-route VPC (adds S3/DynamoDB gateway + Bedrock interface
+# endpoints so they reach AWS without internet). Off by default.
+# enable_vpc = true
+
+# Export OpenTelemetry traces/metrics via an ADOT collector layer (find the ARN for your
+# region+arch at https://aws-otel.github.io/docs/getting-started/lambda). When set together with
+# enable_vpc, the shared VPC also gets X-Ray + CloudWatch interface endpoints.
+# otel_collector_layer_arn = "arn:aws:lambda:us-east-1:901920570463:layer:aws-otel-collector-arm64-ver-0-115-0:1"
+
+# One single-agent stack per project. Point each at its own policy directory
+# (tools.json, broker.cedar, egress-allowlist.toml, meter.toml, pins.json).
+projects = {
+  "care-assistant" = {
+    policy_dir = "../../../../policies" # reuse the repo's example policies to start
+  }
+  # "billing-bot" = {
+  #   policy_dir = "../../projects/billing-bot/policies"
+  #   model_id   = "anthropic.claude-sonnet-4-5-20250929-v1:0"
+  # }
+}

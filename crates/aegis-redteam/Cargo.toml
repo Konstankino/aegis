@@ -1,0 +1,29 @@
+[package]
+name = "aegis-redteam"
+description = "Aegis adaptive attack harness: runs the whole defense against adaptive attacks as a CI release gate (LLM01–10)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# crypto: the Agentic/ASI attacks need Keypair for mesh/identity/intent signing.
+aegis-core = { workspace = true, features = ["crypto"] }
+aegis-broker = { workspace = true }
+aegis-output = { workspace = true }
+aegis-egress = { workspace = true }
+aegis-ingress = { workspace = true }
+aegis-meter = { workspace = true }
+aegis-ledger = { workspace = true }
+aegis-retrieval = { workspace = true }
+aegis-supply = { workspace = true }
+aegis-redact = { workspace = true }
+aegis-mesh = { workspace = true }
+aegis-identity = { workspace = true }
+aegis-intent = { workspace = true }
+aegis-sandbox = { workspace = true }
+aegis-killswitch = { workspace = true }
+aegis-honeypot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

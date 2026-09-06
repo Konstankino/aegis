@@ -1,0 +1,21 @@
+{
+  "decoys": [
+    "169.254.169.254",
+    "169.254.170.2",
+    "metadata.google.internal",
+    ".aws/credentials",
+    "/etc/shadow",
+    "id_rsa",
+    ".ssh/authorized_keys",
+    ".kube/config",
+    ".docker/config.json",
+    ".git-credentials",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "AZURE_CLIENT_SECRET",
+    "/proc/self/environ",
+    "aegis-dump-secrets"
+  ],
+  "canaries": [
+    "aegis-static-canary-9f13a7c2e0b8"
+  ]
+}

@@ -1,0 +1,24 @@
+# Aegis meter limits (Phase 1, LLM06 — unbounded consumption).
+# Loaded by the extension at boot; edit + redeploy (or re-sync from S3) to change budgets.
+# Every field is required. See aegis-meter::Limits.
+
+# Reject a single request estimated above this many tokens (pre-flight, before inference).
+max_tokens_per_request = 100000
+
+# Sliding-window token ceilings.
+tokens_per_minute = 500000
+tokens_per_day    = 20000000
+
+# Per-request and hard cumulative cost caps (USD). The hard cap HALTS the run (trips the
+# circuit breaker) — it is not just an alarm.
+max_cost_per_request_usd = 5.0
+hard_cost_cap_usd        = 50.0
+
+# Agentic circuit breakers.
+max_steps            = 50      # tool calls / loop iterations per session
+max_recursion_depth  = 8       # delegation / recursion depth
+max_wall_clock_ms    = 900000  # 15 min (Lambda's single-invocation ceiling)
+loop_repeat_threshold = 3      # same state hash more than N times -> loop trip
+
+# Inter-agent fan-out cap (§11.1, ASI08 blast radius): max sub-agents/tasks a session may spawn.
+max_fanout = 16

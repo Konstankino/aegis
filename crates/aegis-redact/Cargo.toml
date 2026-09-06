@@ -1,0 +1,12 @@
+[package]
+name = "aegis-redact"
+description = "Aegis disclosure/redaction filter for outputs, reasoning traces, and tool-call args (LLM02/08)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }

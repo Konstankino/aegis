@@ -1,0 +1,32 @@
+[package]
+name = "aegis-egress"
+description = "Aegis egress firewall: default-deny allowlist + query-param stripping, with an axum proxy."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "aegis_egress"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aegis-egress"
+path = "src/bin/proxy.rs"
+
+[dependencies]
+aegis-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+toml = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }

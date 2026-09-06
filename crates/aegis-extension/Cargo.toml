@@ -1,0 +1,64 @@
+[package]
+name = "aegis-extension"
+description = "Aegis inline-plane host: a Lambda external extension wiring broker + output + egress."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "aegis-extension"
+path = "src/main.rs"
+
+[dependencies]
+aegis-core = { workspace = true }
+aegis-broker = { workspace = true }
+aegis-output = { workspace = true }
+aegis-egress = { workspace = true }
+aegis-ingress = { workspace = true }
+aegis-meter = { workspace = true }
+aegis-ledger = { workspace = true }
+aegis-retrieval = { workspace = true }
+aegis-supply = { workspace = true }
+aegis-redact = { workspace = true }
+aegis-killswitch = { workspace = true }
+aegis-sandbox = { workspace = true }
+aegis-honeypot = { workspace = true }
+aegis-intent = { workspace = true }
+lambda-extension = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tower-http = { workspace = true }
+toml = { workspace = true }
+aws-config = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+
+[features]
+# Fetch policy artifacts from S3 at cold start (the §2.4 production shape). Off by default so
+# the lean build and the workspace tests do not pull the AWS SDK.
+default = []
+s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
+# Export traces + metrics over OTLP. Activates only when OTEL_EXPORTER_OTLP_ENDPOINT is set;
+# otherwise the extension degrades to structured logs. Ready out of the box.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+http-body-util = { workspace = true }
+
+[[example]]
+name = "agent_loop"
+path = "examples/agent_loop.rs"

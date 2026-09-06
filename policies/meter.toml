@@ -1,0 +1,9 @@
+# Aegis meter limits — STARTER (empty).
+#
+# With no values set, the extension applies the built-in `aegis-meter::Limits::default()` — a sane,
+# conservative budget (100k tokens/request, $50 hard cap, 50 steps, 900s wall-clock, fan-out 16).
+# To tune, copy the populated reference and edit it:
+#
+#     cp meter.example.toml meter.toml
+#
+# (Every field in the example is required once you define ANY of them — see aegis-meter::Limits.)

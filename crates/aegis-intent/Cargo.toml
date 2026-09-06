@@ -1,0 +1,11 @@
+[package]
+name = "aegis-intent"
+description = "Aegis signed goal/intent envelope bound per execution cycle + goal-drift (ASI01)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aegis-core = { workspace = true, features = ["crypto"] }
+serde = { workspace = true }

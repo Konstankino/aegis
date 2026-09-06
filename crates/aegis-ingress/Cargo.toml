@@ -1,0 +1,12 @@
+[package]
+name = "aegis-ingress"
+description = "Aegis input hygiene: deterministic Unicode stripping (invisible/bidi/tag chars) + provenance wrapping."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aegis-core = { workspace = true }
+serde = { workspace = true }
+unicode-normalization = { workspace = true }

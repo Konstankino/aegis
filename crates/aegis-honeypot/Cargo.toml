@@ -1,0 +1,11 @@
+[package]
+name = "aegis-honeypot"
+description = "Aegis deception layer: planted decoys and canary tokens whose use is a high-signal tripwire (ASI05/ASI08)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "aegis-identity"
+description = "Aegis per-agent identity + delegation control + JIT scoped credentials (ASI03)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aegis-core = { workspace = true, features = ["crypto"] }
+serde = { workspace = true }
+thiserror = { workspace = true }
