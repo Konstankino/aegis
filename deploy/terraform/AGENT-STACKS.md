@@ -32,7 +32,11 @@ deploy/terraform/
   **Aegis gate** on loopback (`/meter/preflight`, `/mediate`, `/decide`) — so a fooled model
   reaches nothing important, budgets are enforced, and the tamper-evident ledger records it.
 - **Conversation state** is checkpointed in a **KMS-encrypted DynamoDB** table keyed by
-  `thread_id`, so it survives the pause.
+  `thread_id`, so it survives the pause. The **Aegis gate state** — per-thread Rule-of-Two taint +
+  meter budget and per-agent quarantine — is persisted to the **same table** (distinct sort keys
+  `aegis#cap`/`aegis#meter`/`aegis#quarantine`, written by the extension's `dynamodb` feature) and
+  rehydrated on a cold resume, so the trifecta/budget/quarantine are **not reset** when a
+  `waitForTaskToken` approval resumes on a fresh execution environment; a store outage fails closed.
 - **The tamper-evident audit ledger** is persisted to a per-project **S3 Object Lock** bucket
   (`AEGIS_LEDGER_BUCKET`); the agent/worker role gets `PutObject` only (append-only, write-once).
 - **The API** is asynchronous (a turn may pause): `POST /chat` starts an execution and returns its
@@ -44,7 +48,7 @@ gated and approvable. Coordination rides on the Step Functions state (the trust 
 
 ## Multi-project isolation
 
-`modules/aegis-shared` creates the shared **extension layer** (built once with `s3,otel`), the
+`modules/aegis-shared` creates the shared **extension layer** (built once with `s3,otel,dynamodb`), the
 **KMS CMK**, and the **policy S3 bucket**. Each project instantiated from `modules/aegis-agent`
 gets its **own** Lambdas, state machine, DynamoDB table, SQS queue, API, IAM roles, and
 **S3 Object Lock audit-ledger bucket** scoped to its resources; its **policies** are uploaded to the

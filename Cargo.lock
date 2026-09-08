@@ -62,6 +62,7 @@ dependencies = [
  "aegis-sandbox",
  "aegis-supply",
  "aws-config",
+ "aws-sdk-dynamodb",
  "aws-sdk-s3",
  "axum",
  "http-body-util",
@@ -119,6 +120,7 @@ name = "aegis-killswitch"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -149,6 +151,7 @@ version = "0.1.0"
 dependencies = [
  "aegis-core",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -439,6 +442,33 @@ dependencies = [
  "pin-project-lite",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "aws-sdk-dynamodb"
+version = "1.123.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dcd10d92058d5da989a7838fd09d70e9457390a81ba672abf5685099f3562bce"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+ "url",
 ]
 
 [[package]]

@@ -216,7 +216,7 @@ deterministic gates a Rust handler would call in-process:
 
 | Endpoint | Crate | Purpose |
 |---|---|---|
-| `POST /mediate` | broker + meter + ledger | Mediate a tool call. Taint, meter budget, and audit ledger are all **server-side, keyed by `thread_id`** — the client can't reset or forge them. The meter circuit breaker runs in front; a ledger entry is appended after. |
+| `POST /mediate` | broker + meter + ledger | Mediate a tool call. Taint, meter budget, and audit ledger are all **server-side, keyed by `thread_id`** — the client can't reset or forge them. The meter circuit breaker runs in front; a ledger entry is appended after. With the `dynamodb` feature, per-thread taint + meter (and per-agent quarantine) are **durably persisted and rehydrated**, so they survive a cold-start resume across a `human_approve` pause; a store outage **fails closed**. |
 | `POST /encode` | output | Context-aware sink-encode a string (`html`/`sql`/`shell`/`path`/`email`/`terminal_log`). |
 | `POST /sanitize` | ingress | Strip invisible/bidi/tag Unicode + NFC-normalize; returns `{text, removed, had_bidi, normalized}`. |
 | `POST /redact` | redact | PII/secret-redact text; returns `{text, findings, total}`. |
@@ -311,7 +311,9 @@ gets the broker and output gates without a Rust handler.
 cargo install cargo-lambda
 
 # Build the extension for the function's architecture (arm64/Graviton shown).
-cargo lambda build -p aegis-extension --extension --release --arm64
+# `dynamodb` makes per-thread taint/meter/quarantine survive a cold-start HITL resume; `s3` pulls
+# policies at boot; `otel` exports traces. (deploy/terraform/build.sh bakes s3,otel,dynamodb.)
+cargo lambda build -p aegis-extension --extension --release --arm64 --features s3,otel,dynamodb
 # -> target/lambda/extensions/aegis-extension  (the required layer layout)
 
 # Publish as a layer and attach it to your agent function.
@@ -327,9 +329,13 @@ Function configuration:
 - `AEGIS_GATE_ADDR` → loopback bind for the gate (default `127.0.0.1:8080`; `AEGIS_EGRESS_ADDR`
   is accepted as a fallback name); point the handler's HTTP client at it, and give the function
   a VPC subnet with **no default route** so the gate's egress check is the only way out (§2.4).
-- IAM (least privilege): the checkpointer's DynamoDB actions + `kms:Decrypt`/`GenerateDataKey`/
-  `DescribeKey` scoped `kms:ViaService = dynamodb.<region>.amazonaws.com`, and S3 read for the
-  policy prefix.
+- `AEGIS_CHECKPOINT_TABLE` → (with the `dynamodb` feature) the DynamoDB table the gate uses to
+  durably persist per-thread taint/meter + per-agent quarantine so they survive a cold-start HITL
+  resume. Reuse the existing checkpoint table — the gate writes distinct sort keys
+  (`aegis#cap`/`aegis#meter`/`aegis#quarantine`). Unset ⇒ in-memory only (unchanged).
+- IAM (least privilege): the checkpointer's DynamoDB actions (`GetItem`/`PutItem` cover the gate's
+  taint store too) + `kms:Decrypt`/`GenerateDataKey`/`DescribeKey` scoped
+  `kms:ViaService = dynamodb.<region>.amazonaws.com`, and S3 read for the policy prefix.
 
 `Decision::HumanApprove` is the Step Functions integration point: return it from the handler
 and let the state machine pause on `waitForTaskToken` until a human approves (§4).

@@ -37,9 +37,16 @@ pub enum Reintegration {
 }
 
 /// The revocation/quarantine registry. Cloneable and cheap to share behind a lock.
-#[derive(Debug, Clone, Default)]
+///
+/// Derives `Serialize`/`Deserialize` so the gate can persist it durably (both fields are
+/// serializable and `Target` already round-trips): a quarantine raised before a HITL pause must
+/// survive a cold restart, or a quarantined agent would silently un-quarantine on resume. Both
+/// fields are `#[serde(default)]` so a partial/older record still loads.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Killswitch {
+    #[serde(default)]
     revoked: HashSet<Target>,
+    #[serde(default)]
     quarantined: HashSet<String>,
 }
 
@@ -157,6 +164,23 @@ mod tests {
         );
         assert!(!ks.is_quarantined("agent-7"));
         assert!(!ks.is_revoked(&Target::Agent("agent-7".into())));
+    }
+
+    #[test]
+    fn registry_round_trips_through_json() {
+        // A registry with a revoked tool + a quarantined agent must survive a durable-store
+        // round-trip so revocations/quarantines persist across a cold restart.
+        let mut ks = Killswitch::new();
+        ks.revoke(Target::Tool("db.write".into()));
+        ks.quarantine("agent-7");
+        let json = serde_json::to_string(&ks).unwrap();
+        let restored: Killswitch = serde_json::from_str(&json).unwrap();
+        assert!(restored.is_revoked(&Target::Tool("db.write".into())));
+        assert!(restored.is_quarantined("agent-7"));
+        assert!(restored.is_revoked(&Target::Agent("agent-7".into())));
+        // An empty object still loads (both fields default).
+        let empty: Killswitch = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.revoked_count(), 0);
     }
 
     #[test]

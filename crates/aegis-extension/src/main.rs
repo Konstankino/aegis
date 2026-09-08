@@ -24,6 +24,7 @@ mod otel;
 mod plane;
 #[cfg(feature = "s3")]
 mod s3;
+mod session_store;
 mod telemetry;
 
 use std::sync::Arc;
@@ -97,12 +98,43 @@ async fn main() -> Result<(), Error> {
     // Gate configuration: Phase-1 meter limits (policies/meter.toml), Phase-2 supply pinset
     // (policies/pins.json), the immutable ledger sink bucket (AEGIS_LEDGER_BUCKET), and the
     // honeypot decoys/canaries (policies/honeypots.json, ASI05/ASI08).
+    // Durable per-thread gate state (Rule-of-Two taint + meter snapshot) + per-agent quarantine,
+    // so they survive a cold restart across a human-approval pause. Backed by the existing
+    // checkpoint table (AEGIS_CHECKPOINT_TABLE) when built with `dynamodb`; a no-op Null store
+    // otherwise, which preserves the prior in-memory-only behaviour.
+    let session_store = {
+        #[cfg(feature = "dynamodb")]
+        {
+            match std::env::var("AEGIS_CHECKPOINT_TABLE")
+                .ok()
+                .filter(|s| !s.is_empty())
+            {
+                Some(table) => {
+                    tracing::info!("durable session store: dynamodb table {table}");
+                    session_store::SessionStore::dynamo(table)
+                }
+                None => {
+                    tracing::warn!(
+                        "durable session store DISABLED (AEGIS_CHECKPOINT_TABLE unset): \
+                         Rule-of-Two taint will not survive a cold-start HITL resume"
+                    );
+                    session_store::SessionStore::null()
+                }
+            }
+        }
+        #[cfg(not(feature = "dynamodb"))]
+        {
+            session_store::SessionStore::null()
+        }
+    };
+
     let gate_config = gate::GateConfig {
         limits: plane::load_meter_limits(&plane::policy_dir()),
         pinset: plane::load_pinset(&plane::policy_dir()),
         ledger_bucket: std::env::var("AEGIS_LEDGER_BUCKET")
             .ok()
             .filter(|s| !s.is_empty()),
+        store: Some(session_store),
         honeypots: {
             // Per-project decoys/static canaries from S3 (honeypots.json), with the layer-baked
             // file as fallback, plus the per-project RUNTIME canary (AEGIS_CANARY) merged on top.

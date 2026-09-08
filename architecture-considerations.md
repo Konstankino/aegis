@@ -207,6 +207,15 @@ impl Capability {
 - **`aegis-ledger`** appends to DynamoDB or S3 with **Object Lock** for immutability,
   correlated to CloudTrail by `run_id`/`thread_id` (the same keys as the LangGraph
   checkpointer).
+- **Durable gate state across HITL pauses:** per-thread Rule-of-Two taint + meter budget and
+  per-agent quarantine are write-through-persisted to the **same KMS-encrypted DynamoDB checkpoint
+  table** (keyed by `thread_id`, distinct sort keys `aegis#cap`/`aegis#meter`/`aegis#quarantine`) and
+  rehydrated on a cold-start cache miss. So a `waitForTaskToken` approval that resumes on a *fresh*
+  execution environment does not silently reset the accumulated trifecta/budget/quarantine — the
+  bypass a cold resume would otherwise open. The gate alone reads/writes it (the client never sees or
+  supplies taint → still unforgeable); a store outage **fails closed** (deny). Enabled by the
+  extension's `dynamodb` feature and the existing `AEGIS_CHECKPOINT_TABLE`; a no-op (pure in-memory,
+  unchanged) otherwise.
 - **Composes with, does not replace, Architecture A:** Step Functions still own orchestration
   and the durable human-approval pause; LangGraph still runs the loop; DynamoDB + KMS still
   hold state. Aegis sits *between* the model and every capability it wants to exercise.

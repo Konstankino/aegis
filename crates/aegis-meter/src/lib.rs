@@ -147,6 +147,39 @@ pub struct Meter {
     tripped: Option<Cow<'static, str>>,
 }
 
+/// A serializable snapshot of a [`Meter`]'s enforcement state.
+///
+/// Purpose: persist a session's budget/breaker state durably so it is **not reset by a cold
+/// restart across a pause** (e.g. a Rule-of-Two HITL `waitForTaskToken` wait). Without this, a
+/// resumed session that lands on a fresh process would regain a full budget and shed its
+/// loop/step/cost history — a real bypass of the LLM06 caps.
+///
+/// The [`Limits`] are deliberately **not** part of the snapshot: they come from the versioned
+/// `meter.toml` config and are supplied to [`Meter::from_snapshot`], so a budget-tightening
+/// re-deploy is honoured on rehydrate rather than being pinned to a stale copy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeterSnapshot {
+    /// Cumulative cost recorded so far (USD).
+    pub total_cost_usd: f64,
+    /// Steps taken so far.
+    pub steps: u32,
+    /// Cumulative fan-out (sub-agents/tasks spawned).
+    pub fanout: u32,
+    /// When the session's wall-clock started (unix ms), if a step has been taken.
+    pub started_ms: Option<u64>,
+    /// The breaker trip reason, if tripped. Stored as an owned string; the live meter holds it as
+    /// `Cow<'static, str>` (all trip reasons are static, so the text round-trips exactly).
+    pub tripped: Option<String>,
+    /// Loop-detection recency ring (state hashes).
+    pub recent_states: Vec<u64>,
+    /// Loop-detection per-state-hash occurrence counts.
+    pub state_counts: std::collections::HashMap<u64, u32>,
+    /// Minute-window token samples `(timestamp_ms, tokens)`.
+    pub minute_samples: Vec<(u64, u64)>,
+    /// Day-window token samples `(timestamp_ms, tokens)`.
+    pub day_samples: Vec<(u64, u64)>,
+}
+
 impl Meter {
     /// A fresh meter with the given limits.
     #[must_use]
@@ -299,6 +332,53 @@ impl Meter {
         }
         Verdict::Proceed
     }
+
+    /// Capture a serializable [`MeterSnapshot`] of the enforcement state, for durable persistence
+    /// so budgets/breakers survive a pause (see [`MeterSnapshot`]). Does not include the limits.
+    #[must_use]
+    pub fn snapshot(&self) -> MeterSnapshot {
+        MeterSnapshot {
+            total_cost_usd: self.total_cost_usd,
+            steps: self.steps,
+            fanout: self.fanout,
+            started_ms: self.started_ms,
+            tripped: self.tripped.as_ref().map(|c| c.to_string()),
+            recent_states: self.recent_states.iter().copied().collect(),
+            state_counts: self.state_counts.clone(),
+            minute_samples: self.minute.samples.iter().copied().collect(),
+            day_samples: self.day.samples.iter().copied().collect(),
+        }
+    }
+
+    /// Rebuild a meter from `limits` (current config) and a previously captured [`MeterSnapshot`].
+    /// The window samples are restored verbatim (ordered oldest-first); stale samples are evicted
+    /// lazily on the next windowed check, exactly as during normal operation.
+    #[must_use]
+    pub fn from_snapshot(limits: Limits, snap: MeterSnapshot) -> Self {
+        let mut minute = WindowCounter::new(60_000);
+        for (ts, amt) in snap.minute_samples {
+            minute.samples.push_back((ts, amt));
+            minute.sum += amt;
+        }
+        let mut day = WindowCounter::new(24 * 60 * 60 * 1000);
+        for (ts, amt) in snap.day_samples {
+            day.samples.push_back((ts, amt));
+            day.sum += amt;
+        }
+        Self {
+            limits,
+            minute,
+            day,
+            total_cost_usd: snap.total_cost_usd,
+            steps: snap.steps,
+            fanout: snap.fanout,
+            started_ms: snap.started_ms,
+            recent_states: snap.recent_states.into_iter().collect(),
+            state_counts: snap.state_counts,
+            // All trip reasons are static strings; `Cow::Owned` preserves the exact text.
+            tripped: snap.tripped.map(Cow::Owned),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -332,6 +412,42 @@ mod tests {
             Verdict::reject("inter-agent fan-out cap exceeded")
         );
         assert!(m.is_tripped());
+    }
+
+    #[test]
+    fn snapshot_round_trips_enforcement_state() {
+        let mut m = Meter::new(small_limits()); // max_steps=3, loop_repeat_threshold=2
+        m.step(0); // steps = 1
+        m.record(0, 100, 0.5); // cost 0.5; minute/day windows hold 100
+        m.observe_state(42); // count{42} = 1
+        m.observe_state(42); // count{42} = 2
+        let snap = m.snapshot();
+
+        // The snapshot survives a JSON round-trip unchanged (the durable-store wire form).
+        let json = serde_json::to_string(&snap).unwrap();
+        let snap2: MeterSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, snap2);
+
+        // A meter rebuilt from the snapshot continues from the same state, not a fresh budget.
+        let mut r = Meter::from_snapshot(small_limits(), snap2);
+        assert_eq!(r.steps(), 1);
+        assert!((r.total_cost_usd() - 0.5).abs() < 1e-9);
+        // Loop-counter continuity: 42 seen twice already; once more exceeds threshold=2 -> trip.
+        assert_eq!(
+            r.observe_state(42),
+            Verdict::reject("loop detected (repeated state)")
+        );
+        assert!(r.is_tripped());
+    }
+
+    #[test]
+    fn snapshot_preserves_a_tripped_breaker() {
+        let mut m = Meter::new(small_limits());
+        m.record(0, 0, 5.0); // exceeds the $2 hard cap -> tripped
+        assert!(m.is_tripped());
+        let r = Meter::from_snapshot(small_limits(), m.snapshot());
+        assert!(r.is_tripped());
+        assert_eq!(r.trip_reason(), Some("hard spending cap reached"));
     }
 
     #[test]

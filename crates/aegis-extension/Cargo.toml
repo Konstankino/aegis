@@ -36,6 +36,7 @@ tower-http = { workspace = true }
 toml = { workspace = true }
 aws-config = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
+aws-sdk-dynamodb = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
@@ -46,6 +47,10 @@ tracing-opentelemetry = { workspace = true, optional = true }
 # the lean build and the workspace tests do not pull the AWS SDK.
 default = []
 s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
+# Durable per-thread gate state (Rule-of-Two taint + meter snapshot) and per-agent quarantine in
+# DynamoDB, so they survive a cold restart across a human-approval pause. Reuses the existing
+# checkpoint table (`AEGIS_CHECKPOINT_TABLE`); off by default so lean builds/tests skip the AWS SDK.
+dynamodb = ["dep:aws-config", "dep:aws-sdk-dynamodb"]
 # Export traces + metrics over OTLP. Activates only when OTEL_EXPORTER_OTLP_ENDPOINT is set;
 # otherwise the extension degrades to structured logs. Ready out of the box.
 otel = [

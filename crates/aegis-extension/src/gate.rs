@@ -3,6 +3,12 @@
 //! in-process Rust handler would. All state (Rule-of-Two taint, meter budget, audit ledger) is
 //! kept server-side, keyed by `thread_id`, so the client can neither reset nor forge it.
 //!
+//! Per-thread taint + meter and per-agent quarantine are additionally **durably backed** (see
+//! [`crate::session_store`]): the in-memory maps are a cache, write-through on change and
+//! read-through (rehydrate) on a cold-start cache miss, so a human-approval (`waitForTaskToken`)
+//! pause that resumes on a fresh execution environment does not silently lose the accumulated
+//! taint/budget/quarantine. When no store is configured this is a no-op and behaviour is unchanged.
+//!
 //! Endpoints:
 //! * `POST /mediate` — broker decision, meter circuit breaker in front, audit-ledger entry after (Phase 0/1).
 //! * `POST /encode` — context-aware sink encoding (output, Phase 0).
@@ -24,10 +30,12 @@
 //! This runs only on loopback, co-located with the function; it is not a public API.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::session_store::{SessionStore, StoreResult};
 
 use aegis_broker::registry::ToolCall;
 use aegis_broker::{Broker, Decision, Session};
@@ -62,6 +70,11 @@ pub struct GateConfig {
     pub pinset: Pinset,
     /// Planted decoys / canaries whose use is a tripwire (§11, ASI05/ASI08).
     pub honeypots: Honeypots,
+    /// Durable backing store for per-thread taint + meter + per-agent quarantine, so they survive
+    /// a cold restart across a human-approval pause. `None` ⇒ the no-durability `Null` store (prior
+    /// in-memory-only behaviour). Set from `AEGIS_CHECKPOINT_TABLE` in production (feature
+    /// `dynamodb`).
+    pub store: Option<Arc<SessionStore>>,
 }
 
 /// Shared state for the gate: the compiled broker + config, plus the per-thread session / meter
@@ -75,10 +88,19 @@ struct GateState {
     ledgers: Arc<Mutex<HashMap<String, Ledger>>>,
     // Agentic emergency-revocation registry (ASI08/10): consulted before every mediation.
     killswitch: Arc<Mutex<Killswitch>>,
+    // Durable backing store for per-thread taint/meter + per-agent quarantine (survives a cold
+    // restart across a HITL pause). `Null` when unconfigured — then everything above is purely
+    // in-memory, exactly as before.
+    store: Arc<SessionStore>,
+    // Agents whose durable quarantine this process has already consulted, so the store is read at
+    // most once per agent per cold environment rather than on every mediation.
+    quarantine_checked: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Build the gate router. Returned fully-stated so it can be `.merge()`d with the egress router.
 pub fn router(broker: Arc<Broker>, config: GateConfig) -> Router {
+    // The durable store (or the no-op Null store when none is configured).
+    let store = config.store.clone().unwrap_or_else(SessionStore::null);
     let state = GateState {
         broker,
         config: Arc::new(config),
@@ -86,6 +108,8 @@ pub fn router(broker: Arc<Broker>, config: GateConfig) -> Router {
         meters: Arc::new(Mutex::new(HashMap::new())),
         ledgers: Arc::new(Mutex::new(HashMap::new())),
         killswitch: Arc::new(Mutex::new(Killswitch::new())),
+        store,
+        quarantine_checked: Arc::new(Mutex::new(HashSet::new())),
     };
     Router::new()
         // Phase 0/1/2.
@@ -170,6 +194,15 @@ async fn mediate(
             .lock()
             .expect("killswitch poisoned")
             .quarantine(req.agent_id.clone());
+        // Durably record the quarantine so it survives a cold restart (best-effort: the in-memory
+        // quarantine already refuses this call; durability guards the *next* cold environment).
+        if let Err(e) = st
+            .store
+            .save_quarantine(&req.agent_id, "honeypot canary in tool arguments")
+            .await
+        {
+            tracing::warn!("quarantine persist failed: {e}");
+        }
         crate::telemetry::record_decision("tripwire", false);
         tracing::warn!(tool = %req.tool, agent = %req.agent_id, "honeypot canary tripwire: agent quarantined");
         return Json(serde_json::json!({
@@ -178,6 +211,19 @@ async fn mediate(
             "reason": "honeypot canary in tool arguments",
             "ledger": { "seq": ledger_seq, "hash": ledger_hash },
         }));
+    }
+
+    // Durable rehydrate (fixes taint loss across a HITL pause): on a cold-start cache miss, restore
+    // this thread's Rule-of-Two taint + meter budget from the store BEFORE any decision, and seed
+    // the killswitch from any durable quarantine for this agent. Both fail CLOSED — a configured
+    // store that cannot be read denies rather than proceed with reset taint.
+    if let Err(e) = ensure_thread_loaded(&st, &key, &req.agent_id, &req.run_id).await {
+        tracing::error!(thread_id = %key, "taint rehydrate failed, denying: {e}");
+        return store_unavailable_deny(&st, &key, now, &req.tool);
+    }
+    if let Err(e) = ensure_quarantine_loaded(&st, &req.agent_id).await {
+        tracing::error!(agent = %req.agent_id, "quarantine rehydrate failed, denying: {e}");
+        return store_unavailable_deny(&st, &key, now, &req.tool);
     }
 
     // 0. Killswitch (ASI08/10): an emergency-revoked tool — or a quarantined agent (e.g. one that
@@ -202,9 +248,10 @@ async fn mediate(
         Verdict::reject(reason)
     } else {
         let mut meters = st.meters.lock().expect("meter store poisoned");
+        // Present because `ensure_thread_loaded` seeded (or rehydrated) it above.
         let meter = meters
-            .entry(key.clone())
-            .or_insert_with(|| Meter::new(st.config.limits.clone()));
+            .get_mut(&key)
+            .expect("meter seeded by ensure_thread_loaded");
         let step = meter.step(now);
         if step.is_proceed() {
             meter.observe_state(loop_hash)
@@ -224,9 +271,10 @@ async fn mediate(
             let call = ToolCall::new(req.tool.clone(), req.args.clone(), prov);
             let (decision, cap) = {
                 let mut sessions = st.sessions.lock().expect("gate session store poisoned");
+                // Present because `ensure_thread_loaded` seeded (or rehydrated) it above.
                 let session = sessions
-                    .entry(key.clone())
-                    .or_insert_with(|| Session::new(req.agent_id, req.run_id, req.thread_id));
+                    .get_mut(&key)
+                    .expect("session seeded by ensure_thread_loaded");
                 (st.broker.mediate(session, &call), session.cap)
             };
             match decision {
@@ -236,6 +284,37 @@ async fn mediate(
             }
         }
     };
+
+    // Write-through: persist this thread's updated taint + meter so a cold-start HITL resume
+    // rehydrates them instead of resetting to zero (the core of the fix). Best-effort for
+    // allow/deny; a `human_approve` is about to pause the run, so its taint MUST be durable first —
+    // else fail closed rather than risk resuming with reset taint.
+    let cap_result = st.store.save_cap(&key, &cap).await;
+    let meter_result = {
+        let snap = st
+            .meters
+            .lock()
+            .expect("meter store poisoned")
+            .get(&key)
+            .map(|m| m.snapshot());
+        match snap {
+            Some(s) => st.store.save_meter(&key, &s).await,
+            None => Ok(()),
+        }
+    };
+    if verdict == "human_approve" {
+        if let Some(e) = cap_result.err().or(meter_result.err()) {
+            tracing::error!(thread_id = %key, "session-state persist failed before HITL pause: {e}");
+            return store_unavailable_deny(&st, &key, now, &req.tool);
+        }
+    } else {
+        if let Err(e) = cap_result {
+            tracing::warn!(thread_id = %key, "cap persist failed ({verdict}): {e}");
+        }
+        if let Err(e) = meter_result {
+            tracing::warn!(thread_id = %key, "meter persist failed ({verdict}): {e}");
+        }
+    }
 
     // 3. Audit ledger (Phase 1): append a tamper-evident entry for this decision.
     let (ledger_seq, ledger_hash) = {
@@ -295,6 +374,157 @@ fn session_cap(st: &GateState, thread_id: &str) -> Capability {
         .unwrap_or(Capability::NONE)
 }
 
+/// Rehydrate a thread's in-memory `Session` + `Meter` from the durable store on a cache miss, so
+/// Rule-of-Two taint and the meter budget are not reset by a cold-start HITL resume. Idempotent
+/// and lock-cheap on a cache hit; all store I/O happens OUTSIDE the maps' mutexes (never `.await`
+/// while holding a `std::sync::Mutex`). Returns `Err` only when a configured store could not be
+/// read — the caller MUST fail closed (deny) rather than proceed with empty taint. With the `Null`
+/// store `load_*` returns `Ok(None)`, so unconfigured deployments behave exactly as before.
+async fn ensure_thread_loaded(
+    st: &GateState,
+    key: &str,
+    agent_id: &str,
+    run_id: &str,
+) -> StoreResult<()> {
+    // Fast path: both already resident this process.
+    {
+        let have_session = st
+            .sessions
+            .lock()
+            .expect("gate session store poisoned")
+            .contains_key(key);
+        let have_meter = st
+            .meters
+            .lock()
+            .expect("meter store poisoned")
+            .contains_key(key);
+        if have_session && have_meter {
+            return Ok(());
+        }
+    }
+    // Cache miss: consult the durable store with no lock held (fail closed on error).
+    let stored_cap = st.store.load_cap(key).await?;
+    let stored_meter = st.store.load_meter(key).await?;
+
+    // Seed the session (insert-if-absent; monotonic taint makes a concurrent race safe to merge).
+    {
+        let mut sessions = st.sessions.lock().expect("gate session store poisoned");
+        match sessions.get_mut(key) {
+            Some(s) => {
+                if let Some(c) = stored_cap {
+                    s.cap.accumulate(&c);
+                }
+            }
+            None => {
+                let mut s = Session::new(agent_id, run_id, key);
+                if let Some(c) = stored_cap {
+                    s.cap = c;
+                }
+                sessions.insert(key.to_string(), s);
+            }
+        }
+    }
+    // Seed the meter from its snapshot, or fresh when the thread is new.
+    {
+        let mut meters = st.meters.lock().expect("meter store poisoned");
+        meters
+            .entry(key.to_string())
+            .or_insert_with(|| match stored_meter {
+                Some(snap) => Meter::from_snapshot(st.config.limits.clone(), snap),
+                None => Meter::new(st.config.limits.clone()),
+            });
+    }
+    Ok(())
+}
+
+/// Meter-only rehydrate for the `/meter/*` endpoints (which carry no `agent_id`, so cannot seed a
+/// session). Restores the meter budget on a cold-start cache miss; fails closed on a store error.
+async fn ensure_meter_loaded(st: &GateState, key: &str) -> StoreResult<()> {
+    if st
+        .meters
+        .lock()
+        .expect("meter store poisoned")
+        .contains_key(key)
+    {
+        return Ok(());
+    }
+    let stored_meter = st.store.load_meter(key).await?;
+    let mut meters = st.meters.lock().expect("meter store poisoned");
+    meters
+        .entry(key.to_string())
+        .or_insert_with(|| match stored_meter {
+            Some(snap) => Meter::from_snapshot(st.config.limits.clone(), snap),
+            None => Meter::new(st.config.limits.clone()),
+        });
+    Ok(())
+}
+
+/// Seed the in-memory killswitch from the durable per-agent quarantine, consulting the store at
+/// most once per agent per cold environment. So an agent quarantined before a HITL pause is still
+/// refused after a cold resume. Fails closed on a store error.
+async fn ensure_quarantine_loaded(st: &GateState, agent_id: &str) -> StoreResult<()> {
+    if st
+        .quarantine_checked
+        .lock()
+        .expect("quarantine set poisoned")
+        .contains(agent_id)
+    {
+        return Ok(());
+    }
+    if st.store.load_quarantine(agent_id).await? {
+        st.killswitch
+            .lock()
+            .expect("killswitch poisoned")
+            .quarantine(agent_id.to_string());
+    }
+    st.quarantine_checked
+        .lock()
+        .expect("quarantine set poisoned")
+        .insert(agent_id.to_string());
+    Ok(())
+}
+
+/// Write-through the current meter snapshot for a thread (best-effort — a lost meter write only
+/// risks a later cold start under-counting the budget, not a taint bypass). Used by `/meter/*`.
+async fn persist_meter(st: &GateState, key: &str) {
+    let snap = st
+        .meters
+        .lock()
+        .expect("meter store poisoned")
+        .get(key)
+        .map(|m| m.snapshot());
+    if let Some(snap) = snap {
+        if let Err(e) = st.store.save_meter(key, &snap).await {
+            tracing::warn!(thread_id = %key, "meter persist failed: {e}");
+        }
+    }
+}
+
+/// The fail-closed response for a store outage: record a `deny` in the audit ledger and refuse.
+/// Used when the durable taint/meter/quarantine store cannot be consulted — the gate must never
+/// proceed with possibly-reset taint.
+fn store_unavailable_deny(
+    st: &GateState,
+    key: &str,
+    now: u64,
+    tool: &str,
+) -> Json<serde_json::Value> {
+    let (seq, hash) = append_ledger(
+        st,
+        key,
+        EntryKind::Decision,
+        format!("deny (session state unavailable) tool={tool}"),
+        now,
+    );
+    crate::telemetry::record_decision("deny", false);
+    Json(serde_json::json!({
+        "decision": "deny",
+        "reason": "session state unavailable",
+        "unavailable": true,
+        "ledger": { "seq": seq, "hash": hash },
+    }))
+}
+
 /// A sink-encode request: encode `value` so it is inert in `sink`.
 #[derive(Debug, Deserialize)]
 struct EncodeRequest {
@@ -347,20 +577,36 @@ async fn meter_preflight(
     Json(req): Json<PreflightRequest>,
 ) -> impl IntoResponse {
     let now = now_ms();
-    let mut meters = st.meters.lock().expect("meter store poisoned");
-    let meter = meters
-        .entry(req.thread_id)
-        .or_insert_with(|| Meter::new(st.config.limits.clone()));
-    let verdict = meter.preflight(now, req.est_tokens, req.est_cost_usd);
-    let (decision, reason) = match &verdict {
-        Verdict::Proceed => ("proceed", None),
-        Verdict::Reject(r) => ("reject", Some(r.to_string())),
+    let key = req.thread_id.clone();
+    // Rehydrate the budget so a cold-start resume doesn't hand back a fresh one. Fail closed.
+    if let Err(e) = ensure_meter_loaded(&st, &key).await {
+        tracing::error!(thread_id = %key, "meter rehydrate failed (preflight): {e}");
+        return Json(serde_json::json!({
+            "decision": "reject",
+            "reason": "session state unavailable",
+            "tripped": true,
+            "total_cost_usd": 0.0,
+        }));
+    }
+    let (decision, reason, tripped, total_cost) = {
+        let mut meters = st.meters.lock().expect("meter store poisoned");
+        let meter = meters
+            .get_mut(&key)
+            .expect("meter seeded by ensure_meter_loaded");
+        let verdict = meter.preflight(now, req.est_tokens, req.est_cost_usd);
+        let (decision, reason) = match &verdict {
+            Verdict::Proceed => ("proceed", None),
+            Verdict::Reject(r) => ("reject", Some(r.to_string())),
+        };
+        (decision, reason, meter.is_tripped(), meter.total_cost_usd())
     };
+    // Preflight can trip the hard-cap breaker — persist the change.
+    persist_meter(&st, &key).await;
     Json(serde_json::json!({
         "decision": decision,
         "reason": reason,
-        "tripped": meter.is_tripped(),
-        "total_cost_usd": meter.total_cost_usd(),
+        "tripped": tripped,
+        "total_cost_usd": total_cost,
     }))
 }
 
@@ -378,15 +624,33 @@ async fn meter_record(
     Json(req): Json<RecordRequest>,
 ) -> impl IntoResponse {
     let now = now_ms();
-    let mut meters = st.meters.lock().expect("meter store poisoned");
-    let meter = meters
-        .entry(req.thread_id)
-        .or_insert_with(|| Meter::new(st.config.limits.clone()));
-    meter.record(now, req.tokens, req.cost_usd);
+    let key = req.thread_id.clone();
+    // Rehydrate so recorded cost accumulates onto the durable total, not a fresh one. Fail closed.
+    if let Err(e) = ensure_meter_loaded(&st, &key).await {
+        tracing::error!(thread_id = %key, "meter rehydrate failed (record): {e}");
+        return Json(serde_json::json!({
+            "tripped": true,
+            "trip_reason": "session state unavailable",
+            "total_cost_usd": 0.0,
+        }));
+    }
+    let (tripped, trip_reason, total_cost) = {
+        let mut meters = st.meters.lock().expect("meter store poisoned");
+        let meter = meters
+            .get_mut(&key)
+            .expect("meter seeded by ensure_meter_loaded");
+        meter.record(now, req.tokens, req.cost_usd);
+        (
+            meter.is_tripped(),
+            meter.trip_reason().map(str::to_string),
+            meter.total_cost_usd(),
+        )
+    };
+    persist_meter(&st, &key).await;
     Json(serde_json::json!({
-        "tripped": meter.is_tripped(),
-        "trip_reason": meter.trip_reason(),
-        "total_cost_usd": meter.total_cost_usd(),
+        "tripped": tripped,
+        "trip_reason": trip_reason,
+        "total_cost_usd": total_cost,
     }))
 }
 
@@ -401,7 +665,29 @@ async fn memory_gate(
     State(st): State<GateState>,
     Json(req): Json<MemoryGateRequest>,
 ) -> impl IntoResponse {
-    let cap = session_cap(&st, &req.thread_id);
+    // Prefer the in-memory session taint; on a cold-start cache miss fall back to the DURABLE
+    // taint so a memory write isn't gated against reset (empty) taint. Read-only — no session is
+    // created here (this endpoint carries no agent_id). Fails closed if the store errors.
+    let cached = st
+        .sessions
+        .lock()
+        .expect("gate session store poisoned")
+        .get(&req.thread_id)
+        .map(|s| s.cap);
+    let cap = match cached {
+        Some(c) => c,
+        None => match st.store.load_cap(&req.thread_id).await {
+            Ok(Some(c)) => c,
+            Ok(None) => Capability::NONE,
+            Err(e) => {
+                tracing::error!(thread_id = %req.thread_id, "memory_gate cap rehydrate failed: {e}");
+                return Json(serde_json::json!({
+                    "decision": "deny",
+                    "reason": "session state unavailable",
+                }));
+            }
+        },
+    };
     let decision = gate_memory_write(&cap, req.content_origin);
     let (verdict, reason) = match decision {
         aegis_ledger::MemoryDecision::Allow => ("allow", None),
@@ -595,6 +881,14 @@ async fn sandbox_validate(
                 .lock()
                 .expect("killswitch poisoned")
                 .quarantine(req.agent_id.clone());
+            // Durably record the quarantine so it survives a cold restart (best-effort).
+            if let Err(e) = st
+                .store
+                .save_quarantine(&req.agent_id, "honeypot decoy touched")
+                .await
+            {
+                tracing::warn!("quarantine persist failed: {e}");
+            }
         }
         crate::telemetry::record_decision("tripwire", false);
         tracing::warn!(decoy, agent = %req.agent_id, "honeypot tripwire: agent quarantined");
@@ -704,6 +998,45 @@ mod tests {
         router(
             test_broker(),
             GateConfig {
+                honeypots: aegis_honeypot::Honeypots {
+                    decoys: vec![],
+                    canaries: vec!["CANARY-7f3a9b21e4c05d68".into()],
+                },
+                ..Default::default()
+            },
+        )
+    }
+
+    use crate::session_store::mem::MemStore;
+
+    /// A router backed by a shared in-memory durable store, so a second router built over the same
+    /// `MemStore` simulates a cold-restart handoff (fresh process, same DynamoDB).
+    fn app_with_store(store: MemStore) -> Router {
+        router(
+            test_broker(),
+            GateConfig {
+                store: Some(std::sync::Arc::new(SessionStore::Mem(store))),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn app_with_store_limits(store: MemStore, limits: Limits) -> Router {
+        router(
+            test_broker(),
+            GateConfig {
+                store: Some(std::sync::Arc::new(SessionStore::Mem(store))),
+                limits,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn app_with_store_canary(store: MemStore) -> Router {
+        router(
+            test_broker(),
+            GateConfig {
+                store: Some(std::sync::Arc::new(SessionStore::Mem(store))),
                 honeypots: aegis_honeypot::Honeypots {
                     decoys: vec![],
                     canaries: vec!["CANARY-7f3a9b21e4c05d68".into()],
@@ -1281,5 +1614,195 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(body["error"].is_string());
+    }
+
+    // ── Durable per-thread state across a HITL pause (cold-resume regression) ────────────────────
+    //
+    // A second router built over the SAME `MemStore` models a cold resume: a fresh process with
+    // empty in-memory maps but the same durable store. These prove the fix — taint, meter budget
+    // and quarantine survive the handoff, and a store outage fails closed.
+
+    #[tokio::test]
+    async fn taint_survives_cold_resume() {
+        let store = MemStore::default();
+        // Gate #1 accumulates untrusted + external taint (legs A+C) on thread t1.
+        let g1 = app_with_store(store.clone());
+        let (_s, b) = post(
+            g1,
+            "/mediate",
+            call(
+                "t1",
+                "web.fetch",
+                serde_json::json!({"url": "https://x"}),
+                "untrusted",
+            ),
+        )
+        .await;
+        assert_eq!(b["decision"], "allow");
+        assert_eq!(b["capability"]["reads_untrusted"], true);
+        assert_eq!(b["capability"]["external_effect"], true);
+
+        // Gate #2 is a COLD process sharing the same store. The next mediation reads sensitive data
+        // (leg B); without rehydration the session would look like NONE and be allowed. With the
+        // fix the taint is restored -> lethal trifecta -> human_approve.
+        let g2 = app_with_store(store.clone());
+        let (_s, b) = post(
+            g2,
+            "/mediate",
+            call(
+                "t1",
+                "db.read_patient",
+                serde_json::json!({"patient_id": "p1"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(b["decision"], "human_approve");
+        assert_eq!(b["capability"]["is_trifecta"], true);
+    }
+
+    #[tokio::test]
+    async fn without_a_store_taint_is_lost_on_a_cold_gate() {
+        // Control (the bug this fixes): with the Null store, two separate gates share no state, so
+        // a cold gate has no memory of the earlier untrusted fetch.
+        let g1 = app();
+        post(
+            g1,
+            "/mediate",
+            call(
+                "t1",
+                "web.fetch",
+                serde_json::json!({"url": "https://x"}),
+                "untrusted",
+            ),
+        )
+        .await;
+        let g2 = app();
+        let (_s, b) = post(
+            g2,
+            "/mediate",
+            call(
+                "t1",
+                "db.read_patient",
+                serde_json::json!({"patient_id": "p1"}),
+                "user",
+            ),
+        )
+        .await;
+        // Single leg B only -> allowed, NOT a trifecta.
+        assert_eq!(b["decision"], "allow");
+        assert_eq!(b["capability"]["is_trifecta"], false);
+    }
+
+    #[tokio::test]
+    async fn store_unavailable_fails_closed() {
+        let store = MemStore::default();
+        store.set_failing(true);
+        let app = app_with_store(store);
+        let (status, b) = post(
+            app,
+            "/mediate",
+            call(
+                "t1",
+                "web.fetch",
+                serde_json::json!({"url": "https://x"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(b["decision"], "deny");
+        assert_eq!(b["reason"], "session state unavailable");
+        assert_eq!(b["unavailable"], true);
+    }
+
+    #[tokio::test]
+    async fn meter_budget_survives_cold_resume() {
+        let store = MemStore::default();
+        let limits = Limits {
+            max_steps: 2,
+            ..Limits::default()
+        };
+        // Gate #1 uses one step.
+        let g1 = app_with_store_limits(store.clone(), limits.clone());
+        let (_s, b) = post(
+            g1,
+            "/mediate",
+            call(
+                "t",
+                "web.fetch",
+                serde_json::json!({"url": "https://a"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(b["decision"], "allow");
+        assert_eq!(b["meter"]["steps"], 1);
+
+        // Gate #2 (cold) shares the store: the step count is rehydrated (1), so it has budget for
+        // exactly one more call before the breaker trips — proving the meter persisted, not reset.
+        let g2 = app_with_store_limits(store.clone(), limits);
+        let (_s, b1) = post(
+            g2.clone(),
+            "/mediate",
+            call(
+                "t",
+                "web.fetch",
+                serde_json::json!({"url": "https://b"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(b1["decision"], "allow"); // step 2 == max, allowed
+        let (_s, b2) = post(
+            g2,
+            "/mediate",
+            call(
+                "t",
+                "web.fetch",
+                serde_json::json!({"url": "https://c"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(b2["decision"], "deny"); // step 3 > max -> circuit breaker
+        assert!(b2["reason"].as_str().unwrap().contains("circuit breaker"));
+    }
+
+    #[tokio::test]
+    async fn quarantine_survives_cold_resume() {
+        let store = MemStore::default();
+        // Gate #1: a canary in the tool args trips the wire and quarantines agent "a" (persisted).
+        let g1 = app_with_store_canary(store.clone());
+        let (_s, b) = post(
+            g1,
+            "/mediate",
+            serde_json::json!({
+                "agent_id": "a", "run_id": "r", "thread_id": "t1",
+                "tool": "web.fetch",
+                "args": {"url": "https://x/?d=CANARY-7f3a9b21e4c05d68"},
+                "arg_provenance": "user"
+            }),
+        )
+        .await;
+        assert_eq!(b["decision"], "deny");
+        assert_eq!(b["tripwire"], true);
+
+        // Gate #2 (cold) shares the store: agent "a" is still refused — the durable quarantine is
+        // seeded into the fresh killswitch — even though nothing was quarantined in THIS process.
+        let g2 = app_with_store(store.clone());
+        let (_s, b) = post(
+            g2,
+            "/mediate",
+            call(
+                "t2",
+                "web.fetch",
+                serde_json::json!({"url": "https://clean"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(b["decision"], "deny");
+        assert!(b["reason"].as_str().unwrap().contains("quarantined"));
     }
 }

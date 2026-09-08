@@ -74,6 +74,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tower-http = { version = "0.7.1", features = ["trace"] }
 aws-config = { version = "1.11.0", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.144.0"
+# DynamoDB client for the durable session-taint/meter/quarantine store (`dynamodb` feature).
+# Pinned loosely to 1.x so cargo resolves the aws-smithy runtime shared with aws-sdk-s3.
+aws-sdk-dynamodb = "1"
 # OpenTelemetry (OTLP export), used behind the extension's `otel` feature.
 opentelemetry = "0.32.0"
 opentelemetry_sdk = { version = "0.32.1", features = ["metrics", "rt-tokio"] }

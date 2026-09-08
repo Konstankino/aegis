@@ -19,8 +19,11 @@ if ! command -v cargo-lambda >/dev/null 2>&1; then
   exit 1
 fi
 
-# `s3` = fetch policies from S3 at cold start (§2.4); `otel` = OTLP traces/metrics export.
-FEATURES="${AEGIS_FEATURES:-s3,otel}"
+# `s3` = fetch policies from S3 at cold start (§2.4); `otel` = OTLP traces/metrics export;
+# `dynamodb` = durable per-thread taint + meter + quarantine (survives a cold-start HITL resume;
+# reuses AEGIS_CHECKPOINT_TABLE). Without `dynamodb` the extension runs in-memory-only and taint
+# is lost across a paused resume that lands on a cold environment.
+FEATURES="${AEGIS_FEATURES:-s3,otel,dynamodb}"
 echo "==> Building aegis-extension for $ARCH via cargo-lambda (features: $FEATURES)"
 ( cd "$WORKSPACE" && cargo lambda build --release --extension -p aegis-extension --features "$FEATURES" $LAMBDA_FLAG )
 

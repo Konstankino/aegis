@@ -1,4 +1,15 @@
 {
-  "decoys": [],
+  "decoys": [
+    "169.254.169.254",
+    "169.254.170.2",
+    "metadata.google.internal",
+    ".aws/credentials",
+    ".ssh/id_rsa",
+    "id_rsa",
+    "/etc/shadow",
+    "/proc/self/environ",
+    ".git-credentials",
+    "aegis-dump-secrets"
+  ],
   "canaries": []
 }

@@ -2,10 +2,13 @@
 
 Deploys the Phase-0 inline plane to AWS and demonstrates it end to end:
 
-- **`aegis-extension` as a Lambda layer** (an external extension, built with the `s3` feature).
-  It boots at cold start, **fetches the policy artifacts from a versioned S3 bucket** (§2.4),
-  and serves the inline-plane gate (`/mediate`, `/encode`, `/decide`, `/healthz`) on loopback.
-  The same artifacts are also baked into the layer at `/opt/policies` as a fallback.
+- **`aegis-extension` as a Lambda layer** (an external extension, built with the
+  `s3,otel,dynamodb` features — see `build.sh`). It boots at cold start, **fetches the policy
+  artifacts from a versioned S3 bucket** (§2.4), and serves the inline-plane gate (`/mediate`,
+  `/encode`, `/decide`, `/healthz`) on loopback. The same artifacts are also baked into the layer at
+  `/opt/policies` as a fallback. The `dynamodb` feature persists per-thread taint/meter + per-agent
+  quarantine to the checkpoint table so they survive a cold-start resume across a human-approval
+  pause (fail-closed on a store outage).
 - **A versioned, encrypted S3 bucket** that is the source of truth for `tools.json`,
   `broker.cedar`, and `egress-allowlist.toml`. Edit a policy, `terraform apply`, and the next
   cold start picks up the new version — no rebuild of the extension needed.
@@ -22,7 +25,9 @@ Deploys the Phase-0 inline plane to AWS and demonstrates it end to end:
   DynamoDB checkpoint table, the SQS approval queue, all CloudWatch log groups, the Step
   Functions state, and the Lambda environment variables (§1.4, §2.4).
 - **A KMS-encrypted DynamoDB checkpointer table** (composite PK/SK) — the LangGraph checkpointer
-  from Architecture A.
+  from Architecture A. The Aegis gate reuses it (distinct sort keys
+  `aegis#cap`/`aegis#meter`/`aegis#quarantine`) to durably hold per-thread taint/meter + quarantine;
+  the existing `GetItem`/`PutItem` grants cover it, so no extra IAM.
 - **An SQS approval queue + optional auto-approver Lambda** that resumes the task-token pause so
   the demo completes end to end (set `auto_approve = false` to approve manually).
 - **(default on) A no-default-route VPC**: a private subnet with no IGW/NAT and a closed-egress
