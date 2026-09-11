@@ -11,13 +11,13 @@
 
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 /// A default-deny egress allowlist. Only destinations that match an entry are permitted, and
 /// even then every query parameter not explicitly permitted is stripped before the request is
 /// allowed out.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Allowlist {
     /// Exact hostnames that are permitted (e.g. `api.internal.example`).
     #[serde(default)]
@@ -35,7 +35,9 @@ pub struct Allowlist {
     /// Honeypot canary tokens (§11, ASI08). Unique planted secrets; any outbound URL containing one
     /// is proof of exfiltration and is denied outright, before host/param logic. Injected at boot
     /// from the per-project `AEGIS_CANARY`, so it is empty in a plain `from_toml` load.
-    #[serde(default)]
+    /// Never serialized when empty, so a policy tool that writes the allowlist back never persists
+    /// the runtime-injected canary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub canaries: Vec<String>,
 }
 

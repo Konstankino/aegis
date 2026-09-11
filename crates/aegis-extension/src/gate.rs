@@ -70,6 +70,9 @@ pub struct GateConfig {
     pub pinset: Pinset,
     /// Planted decoys / canaries whose use is a tripwire (§11, ASI05/ASI08).
     pub honeypots: Honeypots,
+    /// Sandbox exec policy (§11, ASI05). Loaded from `sandbox.toml`; `Default` is the locked-down
+    /// profile, so an absent file keeps the prior behaviour.
+    pub sandbox: SandboxPolicy,
     /// Durable backing store for per-thread taint + meter + per-agent quarantine, so they survive
     /// a cold restart across a human-approval pause. `None` ⇒ the no-durability `Null` store (prior
     /// in-memory-only behaviour). Set from `AEGIS_CHECKPOINT_TABLE` in production (feature
@@ -904,9 +907,9 @@ async fn sandbox_validate(
         );
     }
 
-    // No decoy: the deterministic sandbox policy decides as before. (A production deployment would
-    // load a tuned SandboxPolicy from config; the default is the locked-down profile.)
-    match SandboxPolicy::default().validate(&req.exec) {
+    // No decoy: the deterministic sandbox policy decides. Loaded from `sandbox.toml` into
+    // `GateConfig` at boot (the locked-down profile is the default when the file is absent).
+    match st.config.sandbox.validate(&req.exec) {
         aegis_sandbox::ExecDecision::Allow => (
             StatusCode::OK,
             Json(serde_json::json!({ "allow": true, "tripwire": false })),

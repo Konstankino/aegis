@@ -13,7 +13,12 @@
 use serde::{Deserialize, Serialize};
 
 /// The sandbox configuration a request is checked against.
+///
+/// `#[serde(default)]` at the container level means a partial `sandbox.toml` fills any missing field
+/// from the locked-down [`SandboxPolicy::default`] — so an incomplete or minimal file is safe, never
+/// a parse error, and never accidentally permissive.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SandboxPolicy {
     /// Whether the container may run as root (default false).
     pub allow_root: bool,
@@ -82,6 +87,13 @@ impl ExecDecision {
 const DENYLIST: [&str; 5] = ["rm -rf /", ":(){", "mkfs", "> /dev/sd", "dd if="];
 
 impl SandboxPolicy {
+    /// Load a sandbox policy from TOML text (`sandbox.toml`). Missing fields fall back to the
+    /// locked-down [`Default`] (see the container `#[serde(default)]`), so a partial file is safe.
+    pub fn from_toml(src: &str) -> Result<Self, aegis_core::AegisError> {
+        toml::from_str(src)
+            .map_err(|e| aegis_core::AegisError::Config(format!("bad sandbox policy: {e}")))
+    }
+
     /// Decide whether `req` may execute under this policy.
     #[must_use]
     pub fn validate(&self, req: &ExecRequest) -> ExecDecision {
@@ -123,6 +135,34 @@ mod tests {
             target_path: None,
             approved: true,
         }
+    }
+
+    #[test]
+    fn from_toml_parses_full_partial_and_rejects_garbage() {
+        // Full file round-trips every field.
+        let p = SandboxPolicy::from_toml(
+            "allow_root = true\nallow_network = true\nworking_dir = \"/w\"\n\
+             max_wall_ms = 1000\nmax_memory_mb = 64\n",
+        )
+        .unwrap();
+        assert!(p.allow_root && p.allow_network);
+        assert_eq!(p.working_dir, "/w");
+        assert_eq!(p.max_wall_ms, 1000);
+        assert_eq!(p.max_memory_mb, 64);
+
+        // Partial file fills missing fields from the locked-down default (container serde default).
+        let p = SandboxPolicy::from_toml("allow_network = true\n").unwrap();
+        assert!(p.allow_network);
+        assert!(!p.allow_root); // default
+        assert_eq!(p.working_dir, "/tmp/aegis-sandbox"); // default
+        assert_eq!(p.max_memory_mb, 256); // default
+        assert_eq!(
+            SandboxPolicy::from_toml("").unwrap(),
+            SandboxPolicy::default()
+        );
+
+        // Invalid TOML is a config error, not a silent default.
+        assert!(SandboxPolicy::from_toml("allow_root = = nope").is_err());
     }
 
     #[test]

@@ -1,1 +1,78 @@
-[]
+[
+  {
+    "name": "web.fetch",
+    "reaches_sensitive_data": false,
+    "has_external_effect": true,
+    "consequence": "low_reversible",
+    "schema": {
+      "type": "object",
+      "properties": { "url": { "type": "string", "format": "uri" } },
+      "required": ["url"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "db.read_patient",
+    "reaches_sensitive_data": true,
+    "has_external_effect": false,
+    "consequence": "low_reversible",
+    "schema": {
+      "type": "object",
+      "properties": { "patient_id": { "type": "string", "pattern": "^[A-Za-z0-9-]+$" } },
+      "required": ["patient_id"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "email.send",
+    "reaches_sensitive_data": false,
+    "has_external_effect": true,
+    "consequence": "high_or_irreversible",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "to": { "type": "string" },
+        "subject": { "type": "string" },
+        "body": { "type": "string" }
+      },
+      "required": ["to", "subject", "body"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "os.shell_exec",
+    "reaches_sensitive_data": true,
+    "has_external_effect": true,
+    "consequence": "high_or_irreversible",
+    "schema": {
+      "type": "object",
+      "properties": { "cmd": { "type": "string" } },
+      "required": ["cmd"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "admin.rotate_keys",
+    "reaches_sensitive_data": true,
+    "has_external_effect": true,
+    "consequence": "high_or_irreversible",
+    "schema": {
+      "type": "object",
+      "properties": { "key_id": { "type": "string" } },
+      "required": ["key_id"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "code.run",
+    "reaches_sensitive_data": false,
+    "has_external_effect": false,
+    "consequence": "low_reversible",
+    "schema": {
+      "type": "object",
+      "properties": { "code": { "type": "string" } },
+      "required": ["code"],
+      "additionalProperties": false
+    }
+  }
+]

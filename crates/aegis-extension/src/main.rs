@@ -131,6 +131,7 @@ async fn main() -> Result<(), Error> {
     let gate_config = gate::GateConfig {
         limits: plane::load_meter_limits(&plane::policy_dir()),
         pinset: plane::load_pinset(&plane::policy_dir()),
+        sandbox: plane::load_sandbox_policy(&plane::policy_dir()),
         ledger_bucket: std::env::var("AEGIS_LEDGER_BUCKET")
             .ok()
             .filter(|s| !s.is_empty()),

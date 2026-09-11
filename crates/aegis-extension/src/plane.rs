@@ -98,6 +98,16 @@ pub fn load_pinset(policy_dir: &Path) -> aegis_supply::Pinset {
     }
 }
 
+/// Load the sandbox exec policy from `<dir>/sandbox.toml`, or the locked-down default when the file
+/// is absent or unparseable (§11, ASI05). The gate is always active; the file only tunes the
+/// profile, and a partial file fills missing fields from the default (see `SandboxPolicy`).
+pub fn load_sandbox_policy(policy_dir: &Path) -> aegis_sandbox::SandboxPolicy {
+    match std::fs::read_to_string(policy_dir.join("sandbox.toml")) {
+        Ok(src) => aegis_sandbox::SandboxPolicy::from_toml(&src).unwrap_or_default(),
+        Err(_) => aegis_sandbox::SandboxPolicy::default(),
+    }
+}
+
 /// Load the honeypot decoys/canaries from `<dir>/honeypots.json`, or an empty set when absent or
 /// unparseable (§11, ASI05/ASI08). An empty set is inert — nothing to trip — so a deployment has
 /// zero false positives until decoys/canaries are deliberately configured.

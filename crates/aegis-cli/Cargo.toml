@@ -1,0 +1,36 @@
+[package]
+name = "aegis-cli"
+description = "Aegis policy-management CLI + TUI: author, review, test, and validate the policy artifacts. Local files only."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "aegis"
+path = "src/main.rs"
+
+[lib]
+name = "aegis_cli"
+path = "src/lib.rs"
+
+[dependencies]
+# The policy crates whose types the CLI round-trips through (parse → mutate → re-validate).
+aegis-core = { workspace = true }
+aegis-broker = { workspace = true }
+aegis-egress = { workspace = true }
+aegis-ingress = { workspace = true }
+aegis-meter = { workspace = true }
+aegis-supply = { workspace = true }
+aegis-honeypot = { workspace = true }
+aegis-sandbox = { workspace = true }
+# Serde stack + comment-preserving TOML editing.
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+toml_edit = { workspace = true }
+# CLI + TUI + errors. NO aws/network deps — the tool is strictly local-file-only.
+clap = { workspace = true }
+anyhow = { workspace = true }
+ratatui = { workspace = true }
+cedar-policy-formatter = { workspace = true }

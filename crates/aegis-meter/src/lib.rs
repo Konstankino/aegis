@@ -44,7 +44,12 @@ impl Verdict {
 }
 
 /// The configured budget for one session/run. Loaded from a versioned artifact (`meter.toml`).
+///
+/// `#[serde(default)]` at the container level means a partial or empty `meter.toml` fills any
+/// missing field from [`Limits::default`], so an incomplete file is safe (never a parse error) and
+/// a policy tool can set one field without having to restate the rest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Limits {
     /// Max estimated tokens for a single request (pre-flight rejects above this).
     pub max_tokens_per_request: u64,

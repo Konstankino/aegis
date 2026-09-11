@@ -1,35 +1,37 @@
-# Aegis policies — starters + examples
+# Aegis policies — populated by default
 
 Each policy artifact ships in two forms:
 
 | Live file (`<name>`) | Example (`<name>.example.<ext>`) |
 | --- | --- |
-| **Blank safe starter** — committed default | **Populated reference** — the working demo set |
-| Default-deny / built-in defaults / inert | Copy it in and trim to taste |
+| **Populated working set** — committed default | **Reference copy** — the same content, kept as the canonical source |
+| A real, non-empty starting point you edit | Used to (re)generate the live files and by tests |
 
-The **plain files are intentionally blank** so a fresh checkout (or a new project's policy
-directory) is *safe by default*: default-deny, zero false positives — nothing is permitted until
-you opt in. The `*.example.*` files hold the populated reference set the docs and demos use.
+The **live files ship populated** so a fresh checkout — or `aegis init` — starts with working
+policies, not empty files. The `*.example.*` files hold the canonical reference set (also read by the
+broker acceptance test). For a *safe default-deny* start instead, use `aegis init --blank` (or the
+blank starters below).
 
-| File | Blank starter means | Example provides |
+| File | Populated (default) content | Blank (`--blank`) means |
 | --- | --- | --- |
-| `tools.json` | `[]` — every tool is "unknown" → denied | the demo tool registry (`web.fetch`, `db.read_patient`, `email.send`, `code.run`, …) |
-| `broker.cedar` | no `permit` → default-deny | least-privilege `permit`/`forbid` rules |
-| `egress-allowlist.toml` | no hosts → all egress denied | allowlisted hosts/suffixes + permitted query params |
-| `meter.toml` | empty → built-in `Limits::default()` | an explicit, tunable budget |
-| `pins.json` | `{}` → nothing pinned (fail-closed) | a sample supply-chain pinset |
-| `honeypots.json` | `{"decoys":[],"canaries":[]}` → inert | curated decoys + a static canary |
+| `tools.json` | the demo tool registry (`web.fetch`, `db.read_patient`, `email.send`, `code.run`, …) | `[]` — every tool "unknown" → denied |
+| `broker.cedar` | least-privilege `permit`/`forbid` rules | no `permit` → default-deny |
+| `egress-allowlist.toml` | allowlisted hosts/suffixes + permitted query params | no hosts → all egress denied |
+| `meter.toml` | an explicit, tunable budget | empty → built-in `Limits::default()` |
+| `pins.json` | a sample supply-chain pinset | `{}` → nothing pinned (fail-closed) |
+| `honeypots.json` | curated decoys + a static canary | `{"decoys":[],"canaries":[]}` → inert |
+| `sandbox.toml` | the locked-down exec profile (root/network/wall/memory) | empty → `SandboxPolicy::default()` |
 
-## Activate the reference set
+## Scaffold or reset
 
-Copy every example over its blank starter (run from the repo root):
+`aegis init` writes the populated set into a policy dir (works even in a brand-new empty dir — the
+example content is embedded in the tool). `aegis init --blank` writes the safe default-deny starters.
+
+To regenerate the committed live files from the reference copies (run from the repo root):
 
 ```bash
 for f in policies/*.example.*; do cp "$f" "${f/.example/}"; done
 ```
-
-This makes the local dev gate, the crate examples, `build.sh` (layer bake) and the Terraform
-uploads all use the populated set. Omit it to keep the safe deny-all defaults.
 
 ## Per project
 

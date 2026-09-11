@@ -22,6 +22,7 @@ members = [
     "crates/aegis-honeypot",
     "crates/aegis-redteam",
     "crates/aegis-extension",
+    "crates/aegis-cli",
 ]
 
 [workspace.package]
@@ -88,6 +89,12 @@ opentelemetry-otlp = { version = "0.32.0", default-features = false, features = 
     "metrics",
 ] }
 tracing-opentelemetry = "0.33.0"
+# aegis-cli (the developer policy-management CLI + TUI). Local-file-only: no AWS/network deps.
+clap = { version = "4.5", features = ["derive"] }
+ratatui = "0.29"
+toml_edit = "0.22"
+anyhow = "1"
+cedar-policy-formatter = "4.12.0"
 
 [profile.release]
 lto = true

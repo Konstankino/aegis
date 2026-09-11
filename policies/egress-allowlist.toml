@@ -1,14 +1,21 @@
-# Aegis egress firewall — allowlist STARTER (empty = default-deny).
+# Aegis egress firewall — example default-deny allowlist (architecture-considerations.md §2.4).
 #
-# With no hosts/suffixes below, EVERY outbound destination is denied. Add only the hosts your
-# agent must reach. A populated reference lives in `egress-allowlist.example.toml`; copy it in:
-#
-#     cp egress-allowlist.example.toml egress-allowlist.toml
-#
-# HTTPS-only is the default; every query parameter not named in [permitted_params] is stripped.
+# Only destinations that match `hosts` or `suffixes` are permitted; every query parameter not
+# named in `permitted_params` for that host is stripped before the request is allowed out,
+# closing the query-string exfiltration channel. HTTPS only by default.
 
-hosts    = []
-suffixes = []
-schemes  = ["https"]
+hosts = [
+    "api.internal.example",
+    "bedrock-runtime.us-east-1.amazonaws.com",
+]
 
+suffixes = [
+    ".s3.us-east-1.amazonaws.com",
+]
+
+schemes = ["https"]
+
+# Per-host allowlist of query parameters that may survive. Any host not listed here (or listed
+# with an empty array) has ALL query parameters stripped.
 [permitted_params]
+"api.internal.example" = ["page", "limit"]
