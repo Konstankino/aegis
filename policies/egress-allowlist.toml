@@ -1,21 +1,2 @@
-# Aegis egress firewall — example default-deny allowlist (architecture-considerations.md §2.4).
-#
-# Only destinations that match `hosts` or `suffixes` are permitted; every query parameter not
-# named in `permitted_params` for that host is stripped before the request is allowed out,
-# closing the query-string exfiltration channel. HTTPS only by default.
-
-hosts = [
-    "api.internal.example",
-    "bedrock-runtime.us-east-1.amazonaws.com",
-]
-
-suffixes = [
-    ".s3.us-east-1.amazonaws.com",
-]
-
-schemes = ["https"]
-
-# Per-host allowlist of query parameters that may survive. Any host not listed here (or listed
-# with an empty array) has ALL query parameters stripped.
-[permitted_params]
-"api.internal.example" = ["page", "limit"]
+# Aegis egress allowlist — STARTER (default-deny; no hosts → all egress denied).
+# Managed by `aegis egress`.

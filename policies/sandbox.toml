@@ -1,20 +1,2 @@
-# Aegis sandbox policy (§11, ASI05) — example (locked-down) profile.
-#
-# Loaded by the extension at boot into the `/sandbox/validate` gate. Every field is optional; an
-# omitted field falls back to the built-in locked-down default, so this file is also the documented
-# set of defaults.
-
-# Never run agent-generated code as root.
-allow_root = false
-
-# No direct network from the sandbox — outbound must go through the egress allowlist.
-allow_network = false
-
-# The dedicated, ephemeral working directory; any path a run touches must stay inside it.
-working_dir = "/tmp/aegis-sandbox"
-
-# Wall-clock ceiling per run (milliseconds).
-max_wall_ms = 5000
-
-# Memory ceiling per run (MB).
-max_memory_mb = 256
+# Aegis sandbox policy — STARTER (empty → locked-down SandboxPolicy::default()).
+# Managed by `aegis sandbox`.
