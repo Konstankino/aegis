@@ -1,0 +1,3 @@
+# Aegis JIT grant catalog — STARTER (default-deny; no grants → every JIT request denied).
+# Managed by `aegis jit`. See grants.example.toml for a populated reference.
+grants = []

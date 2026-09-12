@@ -55,6 +55,37 @@ variable "auto_approve" {
   default     = true
 }
 
+variable "jit_grants" {
+  description = <<-EOT
+    JIT credential grants (ASI03/ASI06). For each entry Terraform provisions the least-privilege
+    IAM plumbing the /credentials/issue gate needs — WITHOUT giving the standing agent role any
+    data-plane access:
+
+      * kind = "sts"    → a dedicated per-grant IAM role whose trust policy lets ONLY the agent
+                          role assume it, plus a permission policy scoped to `actions` on
+                          `resource_arns`. The agent role is granted sts:AssumeRole on just these
+                          role ARNs. At mint time the gate further narrows the session with an
+                          inline session policy. Put the created role ARN (see the `jit_role_arns`
+                          output) into the matching grant's `role_arn` in policies/grants.toml.
+      * kind = "secret" → the agent role is granted secretsmanager:GetSecretValue on `secret_arn`
+                          only (JIT fetch; never a standing broad grant).
+
+    Empty by default: no grants → the gate denies every credential request (safe by default).
+  EOT
+  type = map(object({
+    kind          = string
+    actions       = optional(list(string), [])
+    resource_arns = optional(list(string), [])
+    secret_arn    = optional(string, "")
+  }))
+  default = {}
+
+  validation {
+    condition     = alltrue([for g in var.jit_grants : contains(["sts", "secret"], g.kind)])
+    error_message = "each jit_grants entry's kind must be \"sts\" or \"secret\"."
+  }
+}
+
 variable "log_retention_days" {
   description = "CloudWatch Logs retention for the agent function."
   type        = number

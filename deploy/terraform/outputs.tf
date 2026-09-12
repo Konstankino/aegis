@@ -78,3 +78,16 @@ output "demo_trace" {
   description = "Aegis gate decisions returned by the function (broker/output/egress)."
   value       = var.run_demo ? jsondecode(data.aws_lambda_invocation.demo[0].result) : null
 }
+
+# Per-grant STS role ARNs. Copy each into the matching grant's `role_arn` in policies/grants.toml
+# so the gate assumes exactly the role Terraform provisioned for it.
+output "jit_role_arns" {
+  description = "JIT per-grant STS role ARNs, keyed by grant id — set these as role_arn in grants.toml."
+  value       = { for k, r in aws_iam_role.jit : k => r.arn }
+}
+
+# The ExternalId the agent role must present when assuming a JIT role (defense in depth).
+output "jit_external_id" {
+  description = "The sts:ExternalId condition value required to assume any JIT per-grant role."
+  value       = "${var.project_name}-jit"
+}

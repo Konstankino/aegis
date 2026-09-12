@@ -16,6 +16,7 @@ members = [
     "crates/aegis-redact",
     "crates/aegis-mesh",
     "crates/aegis-identity",
+    "crates/aegis-jit",
     "crates/aegis-intent",
     "crates/aegis-sandbox",
     "crates/aegis-killswitch",
@@ -46,6 +47,7 @@ aegis-supply = { path = "crates/aegis-supply" }
 aegis-redact = { path = "crates/aegis-redact" }
 aegis-mesh = { path = "crates/aegis-mesh" }
 aegis-identity = { path = "crates/aegis-identity" }
+aegis-jit = { path = "crates/aegis-jit" }
 aegis-intent = { path = "crates/aegis-intent" }
 aegis-sandbox = { path = "crates/aegis-sandbox" }
 aegis-killswitch = { path = "crates/aegis-killswitch" }
@@ -78,6 +80,10 @@ aws-sdk-s3 = "1.144.0"
 # DynamoDB client for the durable session-taint/meter/quarantine store (`dynamodb` feature).
 # Pinned loosely to 1.x so cargo resolves the aws-smithy runtime shared with aws-sdk-s3.
 aws-sdk-dynamodb = "1"
+# STS (AssumeRole + inline session policy) and Secrets Manager (GetSecretValue) clients for the
+# JIT credential broker (`jit` feature). Loosely pinned to 1.x to share the aws-smithy runtime.
+aws-sdk-sts = "1"
+aws-sdk-secretsmanager = "1"
 # OpenTelemetry (OTLP export), used behind the extension's `otel` feature.
 opentelemetry = "0.32.0"
 opentelemetry_sdk = { version = "0.32.1", features = ["metrics", "rt-tokio"] }

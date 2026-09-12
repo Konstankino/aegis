@@ -18,6 +18,7 @@
 //!   summary, and exits.
 
 mod gate;
+mod jit;
 mod ledger_sink;
 #[cfg(feature = "otel")]
 mod otel;
@@ -132,6 +133,7 @@ async fn main() -> Result<(), Error> {
         limits: plane::load_meter_limits(&plane::policy_dir()),
         pinset: plane::load_pinset(&plane::policy_dir()),
         sandbox: plane::load_sandbox_policy(&plane::policy_dir()),
+        grants: plane::load_grant_catalog(&plane::policy_dir()),
         ledger_bucket: std::env::var("AEGIS_LEDGER_BUCKET")
             .ok()
             .filter(|s| !s.is_empty()),

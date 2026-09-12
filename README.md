@@ -39,6 +39,7 @@ This workspace implements the full LLM roadmap (§5) — **Phase 0** (consequenc
 | [`aegis-redteam`](crates/aegis-redteam) | Adaptive attack harness that runs the whole defense and gates CI | LLM01–10, ASI | ○ | 3 |
 | [`aegis-mesh`](crates/aegis-mesh) | Secure inter-agent comms: signing, anti-replay, protocol pinning, attested registry | ASI07 | ● | §11 |
 | [`aegis-identity`](crates/aegis-identity) | Per-agent identity + JIT scoped credentials + delegation control | ASI03 | ● | §11 |
+| [`aegis-jit`](crates/aegis-jit) | JIT credential broker: exchange an identity credential for a short-lived, scoped STS session / secret ([guide](docs/jit-credentials.md)) | ASI03/06 | ● | §11 |
 | [`aegis-intent`](crates/aegis-intent) | Signed goal/intent envelope bound per cycle + goal-drift | ASI01 | ● | §11 |
 | [`aegis-sandbox`](crates/aegis-sandbox) | Isolated code-execution policy (non-root, ephemeral, gate-before-exec) | ASI05 | ● | §11 |
 | [`aegis-killswitch`](crates/aegis-killswitch) | Emergency revocation + quarantine + gated reintegration | ASI08/10 | ● | §11 |
@@ -61,6 +62,11 @@ Ed25519 via `aegis-core`'s `crypto` feature):
 - **`aegis-identity`** (ASI03) — JIT, short-lived, **scoped credentials** bound to
   subject/audience/purpose/session and the original user intent; delegation can only *narrow*
   scope and must preserve the intent binding (the **confused-deputy** defense).
+- **`aegis-jit`** (ASI03/06) — the **JIT credential broker**: exchanges a validated `aegis-identity`
+  credential for a *real*, short-lived, tightly-scoped cloud credential (an STS session narrowed by
+  an inline session policy, or a just-in-time secret) — so data access is per-call and minutes-long,
+  not a standing long-lived role. The decision is deterministic (identity verify + grant catalog +
+  TTL ceiling + the Rule-of-Two **trifecta gate**); see the **[usage guide](docs/jit-credentials.md)**.
 - **`aegis-intent`** (ASI01) — a signed **goal/scope capsule** per execution cycle; an action
   outside the declared scope is a deviation, and a stable goal id drives drift detection.
 - **`aegis-sandbox`** (ASI05) — the deterministic policy for isolated code execution: non-root,

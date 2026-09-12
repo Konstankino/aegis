@@ -161,6 +161,7 @@ made executable.
 | `aegis-redteam` | Adaptive attack harness (release gate) | LLM01 (all) | ○ |
 | `aegis-mesh` *(new, §11)* | Secure inter-agent communication (mTLS, signing, anti-replay, attested registry) | ASI07, ASI03, ASI04, ASI10 | ● |
 | `aegis-identity` *(new, §11)* | Per-agent identity + delegation control + JIT scoped credentials | ASI03, ASI10 | ● |
+| `aegis-jit` *(new, §11)* | JIT credential broker: exchange an identity credential for a short-lived, scoped STS session / just-in-time secret | ASI03, ASI06 | ● |
 | `aegis-intent` *(new, §11)* | Signed goal/intent envelope bound per execution cycle + goal-drift | ASI01 | ● |
 | `aegis-sandbox` *(new, §11)* | Isolated, non-root, ephemeral code-execution environment | ASI05 | ● |
 | `aegis-killswitch` *(new, §11)* | Emergency revocation + quarantine + recovery/reintegration | ASI04, ASI08, ASI10 | ● |
@@ -701,6 +702,16 @@ Six new crates augment the §2.2 workspace:
   that re-validates the **original user intent** (confused-deputy defense) and forbids privilege
   inheritance without re-validated intent; re-auth on context switch; per-session sandboxes that
   wipe memory between tasks/users. *Primary for ASI03; supports ASI10.*
+- **`aegis-jit`** — the **JIT credential broker**: exchanges a validated `aegis-identity` credential
+  for a *real*, short-lived, tightly-scoped cloud credential — an AWS STS session narrowed by an
+  inline session policy to one resource+action (60–300 s), or a just-in-time Secrets Manager fetch —
+  and nothing else. The deterministic decision (`decide`) is pure (identity verify + grant catalog +
+  TTL ceiling + the broker's Rule-of-Two **trifecta gate**: a write/destination credential that would
+  complete the lethal trifecta is denied or routed to human approval); the real mint lives in the
+  extension behind the `jit` feature and is exposed at the gate as `POST /credentials/issue`. This
+  removes the broad, long-lived Lambda execution role: data access becomes per-call, minutes-long and
+  resource-scoped, and the standing role is reduced to `sts:AssumeRole` on narrow per-grant roles.
+  *Primary for ASI03/ASI06; builds on `aegis-identity` + `aegis-mesh`.*
 - **`aegis-intent`** — a signed **goal/intent envelope** bound per execution cycle ("intent
   capsule"): the broker validates each action against the current declared task/scope and
   pauses/blocks on deviation; a stable goal identifier drives drift alerting. *Primary for ASI01;

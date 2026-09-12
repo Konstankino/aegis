@@ -23,7 +23,9 @@ fi
 # `dynamodb` = durable per-thread taint + meter + quarantine (survives a cold-start HITL resume;
 # reuses AEGIS_CHECKPOINT_TABLE). Without `dynamodb` the extension runs in-memory-only and taint
 # is lost across a paused resume that lands on a cold environment.
-FEATURES="${AEGIS_FEATURES:-s3,otel,dynamodb}"
+# `jit` = mint short-lived STS sessions / just-in-time secrets for the /credentials/issue gate
+# (ASI03/ASI06). Without it the gate still decides but the mint fails closed.
+FEATURES="${AEGIS_FEATURES:-s3,otel,dynamodb,jit}"
 echo "==> Building aegis-extension for $ARCH via cargo-lambda (features: $FEATURES)"
 ( cd "$WORKSPACE" && cargo lambda build --release --extension -p aegis-extension --features "$FEATURES" $LAMBDA_FLAG )
 
@@ -50,6 +52,8 @@ cp "$WORKSPACE/policies/egress-allowlist.toml" "$STAGING/policies/egress-allowli
 cp "$WORKSPACE/policies/meter.toml"            "$STAGING/policies/meter.toml"
 cp "$WORKSPACE/policies/pins.json"             "$STAGING/policies/pins.json"
 cp "$WORKSPACE/policies/honeypots.json"        "$STAGING/policies/honeypots.json"
+cp "$WORKSPACE/policies/sandbox.toml"          "$STAGING/policies/sandbox.toml"
+cp "$WORKSPACE/policies/grants.toml"           "$STAGING/policies/grants.toml"
 
 echo "==> Done. Layer staged:"
 find "$STAGING" -type f | sort

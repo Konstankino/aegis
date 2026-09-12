@@ -31,6 +31,11 @@ fn starter(artifact: Artifact) -> &'static str {
             "# Aegis sandbox policy — STARTER (empty → locked-down SandboxPolicy::default()).\n\
              # Managed by `aegis sandbox`.\n"
         }
+        Artifact::Grants => {
+            "# Aegis JIT grant catalog — STARTER (default-deny; no grants → every request denied).\n\
+             # Managed by `aegis jit`.\n\
+             grants = []\n"
+        }
     }
 }
 
@@ -45,6 +50,7 @@ fn populated(artifact: Artifact) -> &'static str {
         Artifact::Pins => include_str!("../../../policies/pins.example.json"),
         Artifact::Honeypots => include_str!("../../../policies/honeypots.example.json"),
         Artifact::Sandbox => include_str!("../../../policies/sandbox.example.toml"),
+        Artifact::Grants => include_str!("../../../policies/grants.example.toml"),
     }
 }
 

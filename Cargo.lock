@@ -22,7 +22,9 @@ dependencies = [
  "aegis-core",
  "aegis-egress",
  "aegis-honeypot",
+ "aegis-identity",
  "aegis-ingress",
+ "aegis-jit",
  "aegis-meter",
  "aegis-sandbox",
  "aegis-supply",
@@ -73,8 +75,10 @@ dependencies = [
  "aegis-core",
  "aegis-egress",
  "aegis-honeypot",
+ "aegis-identity",
  "aegis-ingress",
  "aegis-intent",
+ "aegis-jit",
  "aegis-killswitch",
  "aegis-ledger",
  "aegis-meter",
@@ -86,6 +90,8 @@ dependencies = [
  "aws-config",
  "aws-sdk-dynamodb",
  "aws-sdk-s3",
+ "aws-sdk-secretsmanager",
+ "aws-sdk-sts",
  "axum",
  "http-body-util",
  "lambda-extension",
@@ -135,6 +141,18 @@ version = "0.1.0"
 dependencies = [
  "aegis-core",
  "serde",
+]
+
+[[package]]
+name = "aegis-jit"
+version = "0.1.0"
+dependencies = [
+ "aegis-core",
+ "aegis-identity",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -580,6 +598,32 @@ dependencies = [
  "sha2 0.11.0",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "aws-sdk-secretsmanager"
+version = "1.114.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f23d9f5b5014b74f4867d029b68d782808b76e5559e20fe6be251f61464bab74"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
 ]
 
 [[package]]

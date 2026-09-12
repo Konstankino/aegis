@@ -1,0 +1,50 @@
+# Aegis JIT grant catalog (ASI03/ASI06) — example (populated) profile.
+#
+# Each grant authorizes exchanging a validated `aegis-identity` credential for ONE real,
+# short-lived, tightly-scoped cloud credential. The deterministic decision lives in `aegis-jit`;
+# the extension mints the real credential (feature `jit`) only after the decision is `Grant`.
+#
+# A request must present a signed credential whose `audience` == the grant's `audience` and whose
+# scopes include `required_scope`. The minted credential lasts at most `max_ttl_secs` and never
+# longer than the presenting credential. `reads_sensitive` / `external_effect` are the Rule-of-Two
+# legs minting contributes to the session, so a write grant that would complete the lethal trifecta
+# is routed to human approval instead of being minted.
+#
+# Managed by `aegis jit`. Blank live file (`grants = []`) denies every request (safe by default).
+
+# ── Read a sensitive data source: a 5-minute STS session scoped to one RDS resource (leg B) ──
+[[grants]]
+id = "patient-db-read"
+audience = "patient-db"
+required_scope = "db.read"
+max_ttl_secs = 300
+reads_sensitive = true       # leg B — reaches regulated data
+external_effect = false
+forbid_when_trifecta = true
+consequence = "low_reversible"
+
+[grants.provider]
+kind = "sts"
+role_arn = "arn:aws:iam::111122223333:role/aegis-jit-patient-db-read"
+resource_arns = ["arn:aws:rds-db:us-east-1:111122223333:dbuser/prod-patients/reader"]
+# Inline session policy rendered by the extension at mint time; `{resource}` is substituted with
+# the matched resource ARN so even a broad role yields a session scoped to exactly this resource.
+session_policy_template = """
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["rds-db:connect"],"Resource":"{resource}"}]}
+"""
+
+# ── Write to a destination: a 60-second Secrets Manager fetch (leg C, irreversible) ──
+[[grants]]
+id = "payments-api-key"
+audience = "payments-gateway"
+required_scope = "payments.charge"
+max_ttl_secs = 60
+reads_sensitive = false
+external_effect = true        # leg C — outbound effect / write to a destination
+forbid_when_trifecta = true
+consequence = "high_or_irreversible"   # charging is irreversible → always human-approved
+
+[grants.provider]
+kind = "secret"
+secret_arn = "arn:aws:secretsmanager:us-east-1:111122223333:secret:payments/api-key-AbCdEf"
+json_key = "api_key"

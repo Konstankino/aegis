@@ -47,6 +47,7 @@ locals {
     "egress-allowlist.toml" = "${local.workspace_dir}/policies/egress-allowlist.toml"
     "meter.toml"            = "${local.workspace_dir}/policies/meter.toml"
     "pins.json"             = "${local.workspace_dir}/policies/pins.json"
+    "grants.toml"           = "${local.workspace_dir}/policies/grants.toml"
   }
 }
 

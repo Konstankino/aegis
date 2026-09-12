@@ -22,3 +22,20 @@ auto_approve = true
 # otel_collector_layer_arn = "arn:aws:lambda:us-east-1:901920570463:layer:aws-otel-collector-arm64-ver-0-115-0:1"
 
 log_retention_days = 14
+
+# JIT credential grants (ASI03/ASI06). Each entry provisions least-privilege IAM plumbing for the
+# /credentials/issue gate WITHOUT giving the standing agent role any data-plane access. After
+# `apply`, copy `terraform output jit_role_arns` into the matching grants' `role_arn` in
+# policies/grants.toml. Leave empty ({}) to keep the JIT broker default-deny.
+# jit_grants = {
+#   patient-db-read = {
+#     kind          = "sts"
+#     actions       = ["rds-db:connect"]
+#     resource_arns = ["arn:aws:rds-db:us-east-1:111122223333:dbuser/prod-patients/reader"]
+#   }
+#   payments-api-key = {
+#     kind       = "secret"
+#     secret_arn = "arn:aws:secretsmanager:us-east-1:111122223333:secret:payments/api-key-AbCdEf"
+#   }
+# }
+jit_grants = {}

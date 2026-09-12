@@ -47,7 +47,9 @@ use aegis_retrieval::{authorize_query, QueryRequest, RetrievalContext};
 use aegis_supply::{Digest, Pinset};
 // Agentic/ASI controls (§11): emergency revocation, sandbox exec policy, intent envelope, honeypots.
 use aegis_honeypot::Honeypots;
+use aegis_identity::{Credential, RequestContext};
 use aegis_intent::IntentCapsule;
+use aegis_jit::{decide as jit_decide, GrantCatalog, JitDecision};
 use aegis_killswitch::{Killswitch, Target};
 use aegis_sandbox::{ExecRequest, SandboxPolicy};
 use axum::{
@@ -73,6 +75,9 @@ pub struct GateConfig {
     /// Sandbox exec policy (§11, ASI05). Loaded from `sandbox.toml`; `Default` is the locked-down
     /// profile, so an absent file keeps the prior behaviour.
     pub sandbox: SandboxPolicy,
+    /// JIT credential grant catalog (§11, ASI03/ASI06). Loaded from `grants.toml`; `Default` is the
+    /// empty catalog, so an absent file denies every credential request (safe by default).
+    pub grants: GrantCatalog,
     /// Durable backing store for per-thread taint + meter + per-agent quarantine, so they survive
     /// a cold restart across a human-approval pause. `None` ⇒ the no-durability `Null` store (prior
     /// in-memory-only behaviour). Set from `AEGIS_CHECKPOINT_TABLE` in production (feature
@@ -131,6 +136,7 @@ pub fn router(broker: Arc<Broker>, config: GateConfig) -> Router {
         .route("/killswitch/status", get(killswitch_status))
         .route("/sandbox/validate", post(sandbox_validate))
         .route("/intent/validate", post(intent_validate))
+        .route("/credentials/issue", post(credentials_issue))
         .with_state(state)
 }
 
@@ -813,6 +819,221 @@ async fn killswitch_status(State(st): State<GateState>) -> impl IntoResponse {
 /// Append a ledger entry for `key`'s thread and persist it to the immutable (Object Lock) sink,
 /// best-effort — the same audit step `mediate` performs, factored out for reuse by the tripwire
 /// path. Returns the new entry's `(seq, hash)`.
+/// A JIT credential-issue request: present a signed identity credential and name a grant; the gate
+/// deterministically decides, then (on `Grant`) mints a real short-lived cloud credential.
+#[derive(Debug, Deserialize)]
+struct IssueRequest {
+    agent_id: String,
+    #[serde(default)]
+    run_id: String,
+    thread_id: String,
+    /// The signed `aegis-identity` credential the agent presents (same one it uses on the mesh).
+    credential: Credential,
+    /// The grant id from `grants.toml`.
+    grant_id: String,
+    /// Requested lifetime in seconds (clamped to the grant ceiling and the credential's life).
+    requested_ttl_secs: u64,
+    /// The action scope requested (defaults to the grant's `required_scope`).
+    #[serde(default)]
+    action_scope: Option<String>,
+}
+
+/// **The JIT credential-issue gate** (§11, ASI03/ASI06). Exchanges a validated identity credential
+/// for a real, short-lived, tightly-scoped cloud credential. Order of controls mirrors `/mediate`:
+/// durable rehydrate → killswitch/quarantine → `aegis_jit::decide` (identity verify + grant + TTL +
+/// Rule-of-Two trifecta gate) → on `Grant`, accumulate taint + persist (write-through) → mint →
+/// audit ledger (metadata only; never the secret material). `HumanApprove` defers the mint to the
+/// same Step Functions `waitForTaskToken` pause the broker uses; nothing is minted until approved.
+#[tracing::instrument(
+    name = "aegis.credentials_issue",
+    skip_all,
+    fields(grant = %req.grant_id, thread_id = %req.thread_id, decision = tracing::field::Empty)
+)]
+async fn credentials_issue(
+    State(st): State<GateState>,
+    Json(req): Json<IssueRequest>,
+) -> impl IntoResponse {
+    let now = now_ms();
+    let key = req.thread_id.clone();
+
+    // Durable rehydrate + quarantine seed (fail closed exactly like /mediate).
+    if let Err(e) = ensure_thread_loaded(&st, &key, &req.agent_id, &req.run_id).await {
+        tracing::error!(thread_id = %key, "taint rehydrate failed, denying jit issue: {e}");
+        return jit_deny_response(StatusCode::SERVICE_UNAVAILABLE, "session state unavailable");
+    }
+    if let Err(e) = ensure_quarantine_loaded(&st, &req.agent_id).await {
+        tracing::error!(agent = %req.agent_id, "quarantine rehydrate failed, denying jit issue: {e}");
+        return jit_deny_response(StatusCode::SERVICE_UNAVAILABLE, "session state unavailable");
+    }
+
+    // Killswitch: a quarantined/revoked agent gets no credential, full stop.
+    if st
+        .killswitch
+        .lock()
+        .expect("killswitch poisoned")
+        .is_revoked(&Target::Agent(req.agent_id.clone()))
+    {
+        append_ledger(
+            &st,
+            &key,
+            EntryKind::Decision,
+            format!("jit deny (agent quarantined) grant={}", req.grant_id),
+            now,
+        );
+        crate::telemetry::record_decision("jit_deny", false);
+        return jit_deny_response(StatusCode::FORBIDDEN, "agent quarantined (killswitch)");
+    }
+
+    // The grant must exist (no grant → deny, the default-deny catalog).
+    let Some(grant) = st.config.grants.get(&req.grant_id).cloned() else {
+        crate::telemetry::record_decision("jit_deny", false);
+        return jit_deny_response(StatusCode::NOT_FOUND, "no such grant");
+    };
+
+    // Deterministic decision (identity verify + grant coherence + TTL ceiling + trifecta gate).
+    let action_scope = req
+        .action_scope
+        .clone()
+        .unwrap_or_else(|| grant.required_scope.clone());
+    let ctx = RequestContext {
+        audience: &req.credential.audience,
+        purpose: &req.credential.purpose,
+        session_id: &req.credential.session_id,
+        action_scope: &action_scope,
+    };
+    let session_cap = session_cap(&st, &key);
+    let decision = jit_decide(
+        &req.credential,
+        &ctx,
+        &grant,
+        &session_cap,
+        now,
+        req.requested_ttl_secs,
+    );
+
+    match decision {
+        JitDecision::Deny(reason) => {
+            append_ledger(
+                &st,
+                &key,
+                EntryKind::Decision,
+                format!("jit deny ({reason}) grant={}", req.grant_id),
+                now,
+            );
+            tracing::Span::current().record("decision", "deny");
+            crate::telemetry::record_decision("jit_deny", false);
+            jit_deny_response(StatusCode::FORBIDDEN, reason)
+        }
+        JitDecision::HumanApprove(reason) => {
+            // Defer to the HITL pause; nothing minted, no taint accrued yet.
+            let (seq, hash) = append_ledger(
+                &st,
+                &key,
+                EntryKind::Decision,
+                format!("jit human_approve ({reason}) grant={}", req.grant_id),
+                now,
+            );
+            tracing::Span::current().record("decision", "human_approve");
+            crate::telemetry::record_decision("jit_human_approve", false);
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "decision": "human_approve",
+                    "reason": reason,
+                    "grant_id": req.grant_id,
+                    "ledger": { "seq": seq, "hash": hash },
+                })),
+            )
+        }
+        JitDecision::Grant {
+            ttl_secs,
+            legs,
+            consequence,
+        } => {
+            // Accumulate the Rule-of-Two taint this credential grants, then persist BEFORE minting —
+            // a minted write credential is an external effect whose taint must survive a cold resume.
+            let cap = {
+                let mut sessions = st.sessions.lock().expect("gate session store poisoned");
+                let session = sessions
+                    .get_mut(&key)
+                    .expect("session seeded by ensure_thread_loaded");
+                session.cap.accumulate(&legs);
+                session.cap
+            };
+            if let Err(e) = st.store.save_cap(&key, &cap).await {
+                tracing::error!(thread_id = %key, "cap persist failed before jit mint: {e}");
+                return jit_deny_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "session state unavailable",
+                );
+            }
+
+            // Mint the real credential (feature `jit`; a lean build fails closed here).
+            let mint_ctx = crate::jit::MintContext {
+                agent_id: req.agent_id.clone(),
+                thread_id: req.thread_id.clone(),
+                intent_hash: req.credential.intent_hash.clone(),
+            };
+            match crate::jit::mint(&grant.provider, ttl_secs, &mint_ctx).await {
+                Ok(minted) => {
+                    // Audit: grant id / audience / ttl / expiry / provider kind — NEVER the secret.
+                    let (seq, hash) = append_ledger(
+                        &st,
+                        &key,
+                        EntryKind::Decision,
+                        format!(
+                            "jit issue grant={} audience={} provider={} ttl={}s exp={} consequence={:?}",
+                            req.grant_id, grant.audience, minted.kind, ttl_secs, minted.expires_at_ms, consequence
+                        ),
+                        now,
+                    );
+                    tracing::Span::current().record("decision", "grant");
+                    crate::telemetry::record_decision("jit_issue", true);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "decision": "grant",
+                            "grant_id": req.grant_id,
+                            "provider": minted.kind,
+                            "expires_at_ms": minted.expires_at_ms,
+                            "credential": minted,
+                            "capability": {
+                                "reads_untrusted": cap.reads_untrusted,
+                                "reads_sensitive": cap.reads_sensitive,
+                                "external_effect": cap.external_effect,
+                                "is_trifecta": cap.is_trifecta(),
+                            },
+                            "ledger": { "seq": seq, "hash": hash },
+                        })),
+                    )
+                }
+                Err(e) => {
+                    // Mint failed — record a deny (no secret in the message) and fail closed.
+                    append_ledger(
+                        &st,
+                        &key,
+                        EntryKind::Decision,
+                        format!("jit mint failed grant={}", req.grant_id),
+                        now,
+                    );
+                    tracing::error!(grant = %req.grant_id, "jit mint failed: {e}");
+                    crate::telemetry::record_decision("jit_deny", false);
+                    jit_deny_response(StatusCode::BAD_GATEWAY, "credential mint failed")
+                }
+            }
+        }
+    }
+}
+
+/// A JIT deny/unavailable response: a fixed non-sensitive reason + status. (No ledger side effect —
+/// callers that need an audit entry append it themselves before calling.)
+fn jit_deny_response(status: StatusCode, reason: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({ "decision": "deny", "reason": reason })),
+    )
+}
+
 fn append_ledger(
     st: &GateState,
     key: &str,
@@ -1807,5 +2028,251 @@ mod tests {
         .await;
         assert_eq!(b["decision"], "deny");
         assert!(b["reason"].as_str().unwrap().contains("quarantined"));
+    }
+
+    // ── JIT credential issue (§11, ASI03/ASI06) ─────────────────────────────────────────────────
+    //
+    // These exercise the deterministic decision path at the gate. The real mint is behind the
+    // `jit` feature (off in tests), so a `Grant` decision reaches the fail-closed stub and returns
+    // 502 — proving the decision passed and the provider is correctly gated, with no AWS call.
+
+    use aegis_core::signing::Keypair;
+    use aegis_identity::Credential;
+    use aegis_jit::{Grant, GrantCatalog, Provider};
+
+    /// A far-future expiry (ms) so a test credential is valid against the real wall clock.
+    const FUTURE: u64 = 9_999_999_999_999;
+
+    fn issuer_kp() -> Keypair {
+        Keypair::from_seed(&[11u8; 32])
+    }
+
+    fn signed_cred(audience: &str, scopes: &[&str], expires_at: u64) -> serde_json::Value {
+        let cred = Credential::issue(
+            &issuer_kp(),
+            "a",
+            audience,
+            "triage",
+            "sess-1",
+            "intent-xyz",
+            scopes.iter().map(|s| s.to_string()).collect(),
+            0,
+            expires_at,
+        );
+        serde_json::to_value(&cred).unwrap()
+    }
+
+    fn read_grant() -> Grant {
+        Grant {
+            id: "db-read".into(),
+            audience: "patient-db".into(),
+            required_scope: "db.read".into(),
+            max_ttl_secs: 300,
+            reads_sensitive: true,
+            external_effect: false,
+            forbid_when_trifecta: true,
+            consequence: aegis_core::Consequence::LowReversible,
+            provider: Provider::Sts {
+                role_arn: "arn:aws:iam::111122223333:role/r".into(),
+                resource_arns: vec!["arn:aws:rds-db:us-east-1:111122223333:dbuser/db/reader".into()],
+                session_policy_template: "{\"Resource\":\"{resource}\"}".into(),
+            },
+        }
+    }
+
+    fn write_grant() -> Grant {
+        Grant {
+            id: "db-write".into(),
+            audience: "patient-db".into(),
+            required_scope: "db.write".into(),
+            max_ttl_secs: 60,
+            reads_sensitive: false,
+            external_effect: true, // leg C
+            forbid_when_trifecta: true,
+            consequence: aegis_core::Consequence::LowReversible,
+            provider: Provider::Secret {
+                secret_arn: "arn:aws:secretsmanager:us-east-1:111122223333:secret:k".into(),
+                json_key: None,
+            },
+        }
+    }
+
+    fn app_with_grants(grants: Vec<Grant>) -> Router {
+        let mut cat = GrantCatalog::empty();
+        for g in grants {
+            cat.upsert(g);
+        }
+        router(
+            test_broker(),
+            GateConfig {
+                grants: cat,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn issue_body(
+        thread: &str,
+        grant: &str,
+        cred: serde_json::Value,
+        ttl: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "agent_id": "a", "run_id": "r", "thread_id": thread,
+            "credential": cred, "grant_id": grant, "requested_ttl_secs": ttl
+        })
+    }
+
+    #[tokio::test]
+    async fn issue_unknown_grant_is_denied() {
+        let app = app();
+        let (status, body) = post(
+            app,
+            "/credentials/issue",
+            issue_body(
+                "t1",
+                "nope",
+                signed_cred("patient-db", &["db.read"], FUTURE),
+                60,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["decision"], "deny");
+        assert_eq!(body["reason"], "no such grant");
+    }
+
+    #[tokio::test]
+    async fn issue_expired_credential_is_denied() {
+        let app = app_with_grants(vec![read_grant()]);
+        let (status, body) = post(
+            app,
+            "/credentials/issue",
+            // credential expired at 500ms; the gate's clock is now, well past it.
+            issue_body(
+                "t1",
+                "db-read",
+                signed_cred("patient-db", &["db.read"], 500),
+                60,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["decision"], "deny");
+        assert_eq!(body["reason"], "credential expired");
+    }
+
+    #[tokio::test]
+    async fn issue_wrong_audience_is_denied() {
+        let app = app_with_grants(vec![read_grant()]);
+        // Credential audience "other" ≠ grant audience "patient-db".
+        let (status, body) = post(
+            app,
+            "/credentials/issue",
+            issue_body(
+                "t1",
+                "db-read",
+                signed_cred("other", &["db.read"], FUTURE),
+                60,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["decision"], "deny");
+    }
+
+    #[tokio::test]
+    async fn issue_valid_grant_reaches_mint_and_is_gated_off_in_lean_build() {
+        // A valid, non-trifecta read grant passes the whole decision path; with the `jit` feature
+        // off the mint stub fails closed (502) — proving the decision succeeded and no AWS call is
+        // made in a lean build.
+        let app = app_with_grants(vec![read_grant()]);
+        let (status, body) = post(
+            app,
+            "/credentials/issue",
+            issue_body(
+                "t1",
+                "db-read",
+                signed_cred("patient-db", &["db.read"], FUTURE),
+                60,
+            ),
+        )
+        .await;
+        if cfg!(feature = "jit") {
+            // With the feature on (and AWS creds in the env) this would mint; we don't assert that
+            // here since tests run without AWS. Accept either a grant or an upstream mint error.
+            assert!(status == StatusCode::OK || status == StatusCode::BAD_GATEWAY);
+        } else {
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(body["reason"], "credential mint failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_completing_the_trifecta_routes_to_human_approval() {
+        let app = app_with_grants(vec![write_grant()]);
+        // Pre-taint the thread to A+B: an UNTRUSTED read of sensitive data (leg A via provenance,
+        // leg B via the tool) — allowed at /mediate (two legs, not the trifecta).
+        let (_s, b) = post(
+            app.clone(),
+            "/mediate",
+            call(
+                "tX",
+                "db.read_patient",
+                serde_json::json!({"patient_id": "p1"}),
+                "untrusted",
+            ),
+        )
+        .await;
+        assert_eq!(b["decision"], "allow");
+        assert_eq!(b["capability"]["reads_untrusted"], true);
+        assert_eq!(b["capability"]["reads_sensitive"], true);
+
+        // Now a leg-C (external_effect) JIT write grant would complete the trifecta → human approval,
+        // and NOTHING is minted (no 502, no secret).
+        let (status, body) = post(
+            app,
+            "/credentials/issue",
+            issue_body(
+                "tX",
+                "db-write",
+                signed_cred("patient-db", &["db.write"], FUTURE),
+                30,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["decision"], "human_approve");
+        assert!(
+            body.get("credential").is_none(),
+            "no secret on the human-approve path"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_denied_for_a_quarantined_agent() {
+        let app = app_with_grants(vec![read_grant()]);
+        // Quarantine agent "a" via the killswitch endpoint (Target = {kind,id}).
+        let (_s, b) = post(
+            app.clone(),
+            "/killswitch/revoke",
+            serde_json::json!({ "kind": "agent", "id": "a" }),
+        )
+        .await;
+        assert_eq!(b["revoked_count"], 1);
+        let (status, body) = post(
+            app,
+            "/credentials/issue",
+            issue_body(
+                "t1",
+                "db-read",
+                signed_cred("patient-db", &["db.read"], FUTURE),
+                60,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["decision"], "deny");
+        assert!(body["reason"].as_str().unwrap().contains("quarantined"));
     }
 }

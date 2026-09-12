@@ -49,6 +49,9 @@ resource "aws_lambda_function" "agent" {
         AEGIS_LEDGER_BUCKET = aws_s3_bucket.ledger.id
         # The handler reads AEGIS_GATE_ADDR to find the loopback gate.
         AEGIS_GATE_ADDR = "127.0.0.1:8080"
+        # ExternalId the extension presents when assuming a JIT per-grant role (must match the
+        # role trust policies in jit.tf). Harmless when no jit_grants are configured.
+        AEGIS_JIT_EXTERNAL_ID = "${var.project_name}-jit"
         # Log level for the extension (also the OTel EnvFilter when otel is built in).
         RUST_LOG = "aegis_extension=info,aegis=info"
         # OpenTelemetry service name (resource attribute).
@@ -85,6 +88,7 @@ resource "aws_lambda_function" "agent" {
     aws_vpc_endpoint.s3,
     aws_iam_role_policy.otel_export,
     aws_iam_role_policy.ledger_write,
+    aws_iam_role_policy.agent_jit,
   ]
 }
 

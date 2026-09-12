@@ -207,7 +207,7 @@ fn validate_all_doctor_and_per_artifact_on_example_set() {
     let findings = validate::validate_all(&dir);
     assert!(validate::all_ok(&findings));
     let rows = validate::per_artifact(&dir);
-    assert_eq!(rows.len(), 7);
+    assert_eq!(rows.len(), Artifact::ALL.len());
     // doctor emits lints (warn/info) on top of validation.
     let d = validate::doctor(&dir);
     assert!(d.len() >= rows.len());

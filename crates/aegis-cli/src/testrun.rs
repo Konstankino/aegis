@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use aegis_broker::{Broker, Decision, Session, ToolCall};
 use aegis_core::{Capability, Provenance};
 use aegis_egress::{Allowlist, EgressDecision};
+use aegis_identity::{Credential, RequestContext};
+use aegis_jit::{decide as jit_decide, JitDecision};
 use aegis_sandbox::{ExecRequest, SandboxPolicy};
 use aegis_supply::Digest;
 
@@ -141,6 +143,113 @@ pub fn sandbox(
     Ok(match policy.validate(&req) {
         aegis_sandbox::ExecDecision::Allow => "allow".to_string(),
         aegis_sandbox::ExecDecision::Deny(reason) => format!("deny   {reason}"),
+    })
+}
+
+// ── test issue: dry-run the JIT credential decision (no AWS) ─────────────────────────────────────
+
+/// The result of a `test issue` dry-run — the deterministic JIT decision, with no cloud call made.
+#[derive(Debug, Clone)]
+pub struct IssueTrace {
+    pub grant_id: String,
+    pub provider: String,
+    /// `grant` | `human_approve` | `deny`.
+    pub decision: String,
+    pub detail: String,
+    /// For an STS grant that would be minted (or human-approved), the rendered inline session
+    /// policy — proof of exactly how the real session would be scoped. `None` for a denial or a
+    /// secret grant.
+    pub session_policy: Option<String>,
+}
+
+/// Parse a legs string like `"AB"` / `"abc"` into a [`Capability`] (A=untrusted, B=sensitive,
+/// C=external). An empty string is no taint.
+fn parse_legs(s: &str) -> Capability {
+    let mut cap = Capability::NONE;
+    for ch in s.chars() {
+        match ch.to_ascii_uppercase() {
+            'A' => cap.reads_untrusted = true,
+            'B' => cap.reads_sensitive = true,
+            'C' => cap.external_effect = true,
+            _ => {}
+        }
+    }
+    cap
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// `test issue --grant --cred --ttl …` — deterministically decide whether the credential in
+/// `cred_path` may mint the named grant, **without any AWS call**. Mirrors the gate's decision path
+/// (`aegis_jit::decide`) so a developer can troubleshoot a grant before deploy.
+pub fn issue(
+    dir: &PolicyDir,
+    grant_id: &str,
+    cred_path: &str,
+    ttl_secs: u64,
+    scope: Option<&str>,
+    legs: Option<&str>,
+    now_ms_override: Option<u64>,
+) -> Result<IssueTrace> {
+    let catalog = domains::jit::load(dir)?;
+    let grant = catalog
+        .get(grant_id)
+        .ok_or_else(|| anyhow::anyhow!("no such grant '{grant_id}' in grants.toml"))?;
+
+    let cred_src = std::fs::read_to_string(cred_path)
+        .with_context(|| format!("reading credential file {cred_path}"))?;
+    let cred: Credential = serde_json::from_str(&cred_src)
+        .with_context(|| format!("{cred_path} is not a valid identity Credential JSON"))?;
+
+    let action_scope = scope.unwrap_or(&grant.required_scope);
+    let ctx = RequestContext {
+        audience: &cred.audience,
+        purpose: &cred.purpose,
+        session_id: &cred.session_id,
+        action_scope,
+    };
+    let session_cap = parse_legs(legs.unwrap_or(""));
+    let now = now_ms_override.unwrap_or_else(now_ms);
+
+    let decision = jit_decide(&cred, &ctx, grant, &session_cap, now, ttl_secs);
+
+    // The rendered session policy is meaningful only for an STS grant that is (or could be) minted.
+    let session_policy = match &decision {
+        JitDecision::Grant { .. } | JitDecision::HumanApprove(_) => {
+            grant.provider.rendered_session_policy()
+        }
+        JitDecision::Deny(_) => None,
+    };
+
+    let (decision_s, detail) = match &decision {
+        JitDecision::Grant {
+            ttl_secs,
+            legs,
+            consequence,
+        } => (
+            "grant".to_string(),
+            format!(
+                "ttl={ttl_secs}s legs={}{} consequence={:?}",
+                if legs.reads_sensitive { "B" } else { "-" },
+                if legs.external_effect { "C" } else { "-" },
+                consequence
+            ),
+        ),
+        JitDecision::HumanApprove(r) => ("human_approve".to_string(), (*r).to_string()),
+        JitDecision::Deny(r) => ("deny".to_string(), (*r).to_string()),
+    };
+
+    Ok(IssueTrace {
+        grant_id: grant_id.to_string(),
+        provider: grant.provider.kind().to_string(),
+        decision: decision_s,
+        detail,
+        session_policy,
     })
 }
 
@@ -565,6 +674,133 @@ mod tests {
         .unwrap();
         assert_eq!(t.outcome, "BLOCKED");
         assert!(t.stages.iter().any(|s| s.verdict == "tripwire"));
+        std::fs::remove_dir_all(dir.root()).ok();
+    }
+
+    fn write_cred(dir: &PolicyDir, scopes: &[&str], expires_at: u64) -> std::path::PathBuf {
+        use aegis_core::signing::Keypair;
+        let kp = Keypair::from_seed(&[9u8; 32]);
+        let cred = Credential::issue(
+            &kp,
+            "agent-a",
+            "patient-db",
+            "triage",
+            "sess-1",
+            "intent-xyz",
+            scopes.iter().map(|s| s.to_string()).collect(),
+            0,
+            expires_at,
+        );
+        let path = dir.root().join("cred.json");
+        std::fs::write(&path, serde_json::to_string(&cred).unwrap()).unwrap();
+        path
+    }
+
+    fn add_read_grant(dir: &PolicyDir) {
+        crate::domains::jit::add_sts(
+            dir,
+            crate::domains::jit::StsGrantSpec {
+                id: "patient-db-read".into(),
+                audience: "patient-db".into(),
+                scope: "db.read".into(),
+                role_arn: "arn:aws:iam::111122223333:role/r".into(),
+                resource_arns: vec!["arn:aws:rds-db:us-east-1:111122223333:dbuser/db/reader".into()],
+                session_policy_template:
+                    "{\"Resource\":\"{resource}\"}".into(),
+                max_ttl_secs: 300,
+                leg: crate::domains::jit::Leg::Read,
+                irreversible: false,
+            },
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn issue_grants_and_renders_session_policy() {
+        let dir = unique_temp_dir("issue-ok");
+        add_read_grant(&dir);
+        let cred = write_cred(&dir, &["db.read", "db.write"], 1_000_000);
+        let t = issue(
+            &dir,
+            "patient-db-read",
+            cred.to_str().unwrap(),
+            60,
+            None,
+            None,
+            Some(1_000),
+        )
+        .unwrap();
+        assert_eq!(t.decision, "grant");
+        assert_eq!(t.provider, "sts");
+        assert!(t.detail.contains("ttl=60s"));
+        // The rendered session policy substitutes the concrete resource ARN.
+        let pol = t.session_policy.unwrap();
+        assert!(pol.contains("dbuser/db/reader") && !pol.contains("{resource}"));
+        std::fs::remove_dir_all(dir.root()).ok();
+    }
+
+    #[test]
+    fn issue_routes_to_human_when_completing_the_trifecta() {
+        let dir = unique_temp_dir("issue-tri");
+        // A write (leg C) grant against a session already tainted A+B → trifecta → human.
+        crate::domains::jit::add_secret(
+            &dir,
+            crate::domains::jit::SecretGrantSpec {
+                id: "w".into(),
+                audience: "patient-db".into(),
+                scope: "db.write".into(),
+                secret_arn: "arn:aws:secretsmanager:us-east-1:111122223333:secret:k".into(),
+                json_key: None,
+                max_ttl_secs: 60,
+                leg: crate::domains::jit::Leg::Write,
+                irreversible: false,
+            },
+            false,
+        )
+        .unwrap();
+        let cred = write_cred(&dir, &["db.write"], 1_000_000);
+        let t = issue(
+            &dir,
+            "w",
+            cred.to_str().unwrap(),
+            30,
+            Some("db.write"),
+            Some("AB"),
+            Some(1_000),
+        )
+        .unwrap();
+        assert_eq!(t.decision, "human_approve");
+        std::fs::remove_dir_all(dir.root()).ok();
+    }
+
+    #[test]
+    fn issue_denies_expired_credential_and_unknown_grant() {
+        let dir = unique_temp_dir("issue-deny");
+        add_read_grant(&dir);
+        let cred = write_cred(&dir, &["db.read"], 500); // expires at 500ms
+        let t = issue(
+            &dir,
+            "patient-db-read",
+            cred.to_str().unwrap(),
+            60,
+            None,
+            None,
+            Some(1_000),
+        )
+        .unwrap();
+        assert_eq!(t.decision, "deny");
+        // Unknown grant id errors out.
+        assert!(issue(
+            &dir,
+            "nope",
+            cred.to_str().unwrap(),
+            60,
+            None,
+            None,
+            Some(1_000)
+        )
+        .is_err());
         std::fs::remove_dir_all(dir.root()).ok();
     }
 

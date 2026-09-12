@@ -7,6 +7,7 @@
 use aegis_broker::{Broker, PolicyEngine, ToolRegistry};
 use aegis_egress::Allowlist;
 use aegis_honeypot::Honeypots;
+use aegis_jit::GrantCatalog;
 use aegis_meter::Limits;
 use aegis_sandbox::SandboxPolicy;
 use aegis_supply::Pinset;
@@ -75,6 +76,9 @@ pub fn validate_text(artifact: Artifact, text: &str) -> Result<(), String> {
             .map_err(|x| x.to_string()),
         Artifact::Sandbox => SandboxPolicy::from_toml(text)
             .map(|_| ())
+            .map_err(|x| x.to_string()),
+        Artifact::Grants => GrantCatalog::from_toml(text)
+            .and_then(|c| c.validate())
             .map_err(|x| x.to_string()),
     }
 }
@@ -184,6 +188,11 @@ pub fn validate_all(dir: &PolicyDir) -> Vec<Finding> {
             .map(|_| "valid".to_string())
             .map_err(|e| e.to_string())
     }));
+    out.push(check(dir, Artifact::Grants, |t| {
+        let cat = GrantCatalog::from_toml(t).map_err(|e| e.to_string())?;
+        cat.validate().map_err(|e| e.to_string())?;
+        Ok(format!("{} grant(s)", cat.all().len()))
+    }));
 
     out
 }
@@ -284,6 +293,18 @@ pub fn doctor(dir: &PolicyDir) -> Vec<Finding> {
                     Some(Artifact::Sandbox),
                     Status::Warn,
                     "sandbox allows root",
+                ));
+            }
+        }
+    }
+    // jit grants
+    if !errored(&findings, Artifact::Grants) {
+        if let Ok(cat) = crate::domains::jit::load(dir) {
+            if cat.all().is_empty() {
+                findings.push(Finding::new(
+                    Some(Artifact::Grants),
+                    Status::Info,
+                    "no grants → every JIT credential request is denied (default-deny)",
                 ));
             }
         }

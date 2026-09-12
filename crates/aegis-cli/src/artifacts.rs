@@ -22,11 +22,13 @@ pub enum Artifact {
     Honeypots,
     /// `sandbox.toml` — the code-execution sandbox policy.
     Sandbox,
+    /// `grants.toml` — the JIT credential grant catalog.
+    Grants,
 }
 
 impl Artifact {
     /// Every managed artifact, in a stable display order.
-    pub const ALL: [Artifact; 7] = [
+    pub const ALL: [Artifact; 8] = [
         Artifact::Tools,
         Artifact::BrokerCedar,
         Artifact::Egress,
@@ -34,6 +36,7 @@ impl Artifact {
         Artifact::Pins,
         Artifact::Honeypots,
         Artifact::Sandbox,
+        Artifact::Grants,
     ];
 
     /// The on-disk basename (a constant — never user-controlled).
@@ -46,6 +49,7 @@ impl Artifact {
             Artifact::Pins => "pins.json",
             Artifact::Honeypots => "honeypots.json",
             Artifact::Sandbox => "sandbox.toml",
+            Artifact::Grants => "grants.toml",
         }
     }
 
@@ -69,6 +73,7 @@ impl Artifact {
             Artifact::Pins => "supply",
             Artifact::Honeypots => "honeypot",
             Artifact::Sandbox => "sandbox",
+            Artifact::Grants => "jit",
         }
     }
 
@@ -82,6 +87,7 @@ impl Artifact {
             Artifact::Pins => "supply pinset",
             Artifact::Honeypots => "honeypots",
             Artifact::Sandbox => "sandbox policy",
+            Artifact::Grants => "jit grants",
         }
     }
 }

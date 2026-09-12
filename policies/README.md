@@ -22,6 +22,7 @@ Every path is denied until you add a rule. The `*.example.*` files hold the popu
 | `pins.json` | `{}` → nothing pinned (fail-closed) | a sample supply-chain pinset |
 | `honeypots.json` | `{"decoys":[],"canaries":[]}` → inert | curated decoys + a static canary |
 | `sandbox.toml` | empty → locked-down `SandboxPolicy::default()` | the locked-down exec profile (root/network/wall/memory) |
+| `grants.toml` | `grants = []` → every JIT credential request denied | worked STS + Secrets grants (see the JIT credential broker) |
 
 ## Scaffold or reset
 

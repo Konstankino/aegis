@@ -32,6 +32,7 @@ it mitigates, fully or partially. The two files are kept in sync — when a crat
 | `aegis-redteam` | Adaptive attack harness (release gate) | **LLM01** (all, as a gate) | ASI08 (digital-twin replay gate) | ○ |
 | `aegis-mesh` *(§11)* | Secure inter-agent communication (mTLS, signing, anti-replay, attested registry) | — | **ASI07**, ASI03, ASI04, ASI10 | ● |
 | `aegis-identity` *(§11)* | Per-agent identity + delegation control + JIT scoped credentials | — | **ASI03**, ASI10 | ● |
+| `aegis-jit` *(§11)* | JIT credential broker: exchange a validated identity credential for a short-lived, scoped STS session / just-in-time secret | — | **ASI03**, **ASI06** | ● |
 | `aegis-intent` *(§11)* | Signed goal/intent envelope per execution cycle + goal-drift | — | **ASI01** | ● |
 | `aegis-sandbox` *(§11)* | Isolated, non-root, ephemeral code-execution environment | — | **ASI05**, ASI10 | ● |
 | `aegis-killswitch` *(§11)* | Emergency revocation + quarantine + gated reintegration | — | **ASI04**, **ASI08**, **ASI10** | ● |

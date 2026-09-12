@@ -24,6 +24,10 @@ aegis-meter = { workspace = true }
 aegis-supply = { workspace = true }
 aegis-honeypot = { workspace = true }
 aegis-sandbox = { workspace = true }
+# JIT credential broker (pure, no AWS/network deps) + the identity credential it consumes, so the
+# CLI can author `grants.toml` and dry-run `aegis test issue` locally without any cloud call.
+aegis-jit = { workspace = true }
+aegis-identity = { workspace = true }
 # Serde stack + comment-preserving TOML editing.
 serde = { workspace = true }
 serde_json = { workspace = true }

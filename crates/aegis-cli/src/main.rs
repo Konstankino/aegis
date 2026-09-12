@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use aegis_cli::domains::{broker, egress, honeypot, meter, sandbox, supply};
+use aegis_cli::domains::{broker, egress, honeypot, jit, meter, sandbox, supply};
 use aegis_cli::io::WriteOutcome;
 use aegis_cli::validate::{self, Status};
 use aegis_cli::{scaffold, testrun, tui, Artifact, Format, PolicyDir};
@@ -94,6 +94,11 @@ enum Command {
         #[command(subcommand)]
         cmd: SandboxCmd,
     },
+    /// JIT credential grant catalog (grants.toml).
+    Jit {
+        #[command(subcommand)]
+        cmd: JitCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -146,6 +151,30 @@ enum TestCmd {
         approved: bool,
         #[arg(long)]
         path: Option<String>,
+    },
+    /// Dry-run the JIT credential decision for a grant against a signed identity credential —
+    /// deterministic, no AWS call. Prints Grant/HumanApprove/Deny + clamped TTL + (STS) session
+    /// policy.
+    Issue {
+        /// The grant id from grants.toml.
+        #[arg(long)]
+        grant: String,
+        /// Path to a JSON-serialized `aegis_identity::Credential` to present.
+        #[arg(long)]
+        cred: String,
+        /// Requested lifetime in seconds (clamped to the grant ceiling and the credential's life).
+        #[arg(long, default_value_t = 300)]
+        ttl: u64,
+        /// The action scope requested (defaults to the grant's required_scope).
+        #[arg(long)]
+        scope: Option<String>,
+        /// Simulated already-accumulated session taint legs, e.g. `--legs AB` (A=untrusted,
+        /// B=sensitive, C=external). Lets you preview the trifecta gate.
+        #[arg(long)]
+        legs: Option<String>,
+        /// Clock in Unix ms for the decision (defaults to now).
+        #[arg(long)]
+        now_ms: Option<u64>,
     },
     /// Run ONE tool call through the whole deterministic gate chain
     /// (ingress → honeypot → broker mediate → egress → sandbox), end to end.
@@ -331,6 +360,61 @@ enum SandboxCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum JitCmd {
+    /// List all grants.
+    List,
+    /// Show one grant by id.
+    Show { id: String },
+    /// Add (or replace) an STS-session grant.
+    AddSts {
+        id: String,
+        #[arg(long)]
+        audience: String,
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        role_arn: String,
+        /// A resource ARN this grant may touch (repeatable).
+        #[arg(long = "resource")]
+        resources: Vec<String>,
+        /// Inline session-policy JSON, a file path, or `-` for stdin.
+        #[arg(long)]
+        session_policy: Option<String>,
+        #[arg(long, default_value_t = 300)]
+        max_ttl: u64,
+        /// Which Rule-of-Two leg: read (sensitive, leg B) or write (external, leg C).
+        #[arg(long, default_value = "read")]
+        leg: String,
+        /// Mark the effect irreversible/high-consequence (always human-approved).
+        #[arg(long)]
+        irreversible: bool,
+    },
+    /// Add (or replace) a Secrets Manager grant.
+    AddSecret {
+        id: String,
+        #[arg(long)]
+        audience: String,
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        secret_arn: String,
+        /// Optional JSON key to pluck from the secret value.
+        #[arg(long)]
+        json_key: Option<String>,
+        #[arg(long, default_value_t = 60)]
+        max_ttl: u64,
+        #[arg(long, default_value = "write")]
+        leg: String,
+        #[arg(long)]
+        irreversible: bool,
+    },
+    /// Change a grant's TTL ceiling (seconds).
+    SetTtl { id: String, secs: u64 },
+    /// Remove a grant.
+    Rm { id: String },
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli) {
@@ -374,6 +458,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Supply { cmd } => run_supply(&dir, cmd, format, dry, cli.yes, color)?,
         Command::Honeypot { cmd } => run_honeypot(&dir, cmd, format, dry, cli.yes, color)?,
         Command::Sandbox { cmd } => run_sandbox(&dir, cmd, format, dry, cli.yes, color)?,
+        Command::Jit { cmd } => run_jit(&dir, cmd, format, dry, cli.yes, color)?,
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -455,6 +540,42 @@ fn run_test(dir: &PolicyDir, what: TestCmd, color: bool) -> Result<()> {
             "{}",
             testrun::sandbox(dir, &command, wants_root, wants_network, approved, path)?
         ),
+        TestCmd::Issue {
+            grant,
+            cred,
+            ttl,
+            scope,
+            legs,
+            now_ms,
+        } => {
+            let t = testrun::issue(
+                dir,
+                &grant,
+                &cred,
+                ttl,
+                scope.as_deref(),
+                legs.as_deref(),
+                now_ms,
+            )?;
+            let status = match t.decision.as_str() {
+                "grant" => Status::Ok,
+                "human_approve" => Status::Warn,
+                _ => Status::Error,
+            };
+            println!(
+                "grant {} [{}]  {}  {}",
+                t.grant_id,
+                t.provider,
+                p.paint(status, &t.decision),
+                t.detail
+            );
+            if let Some(policy) = &t.session_policy {
+                println!("  session policy (rendered):");
+                for line in policy.trim().lines() {
+                    println!("    {line}");
+                }
+            }
+        }
         TestCmd::Pipeline {
             tool,
             args,
@@ -780,6 +901,83 @@ fn run_sandbox(
                 max_memory_mb,
             };
             print_outcome(Artifact::Sandbox, &sandbox::set(dir, &ov, dry)?, color);
+        }
+    }
+    Ok(())
+}
+
+fn parse_leg(s: &str) -> Result<jit::Leg> {
+    match s.to_ascii_lowercase().as_str() {
+        "read" | "b" => Ok(jit::Leg::Read),
+        "write" | "c" => Ok(jit::Leg::Write),
+        other => anyhow::bail!("invalid --leg '{other}' (expected read|write)"),
+    }
+}
+
+fn run_jit(
+    dir: &PolicyDir,
+    cmd: JitCmd,
+    format: Format,
+    dry: bool,
+    yes: bool,
+    color: bool,
+) -> Result<()> {
+    match cmd {
+        JitCmd::List => print!("{}", jit::show(dir, format)?),
+        JitCmd::Show { id } => print!("{}", jit::show_one(dir, &id, format)?),
+        JitCmd::AddSts {
+            id,
+            audience,
+            scope,
+            role_arn,
+            resources,
+            session_policy,
+            max_ttl,
+            leg,
+            irreversible,
+        } => {
+            let spec = jit::StsGrantSpec {
+                id,
+                audience,
+                scope,
+                role_arn,
+                resource_arns: resources,
+                session_policy_template: resolve_schema(session_policy)?.unwrap_or_default(),
+                max_ttl_secs: max_ttl,
+                leg: parse_leg(&leg)?,
+                irreversible,
+            };
+            print_outcome(Artifact::Grants, &jit::add_sts(dir, spec, dry)?, color);
+        }
+        JitCmd::AddSecret {
+            id,
+            audience,
+            scope,
+            secret_arn,
+            json_key,
+            max_ttl,
+            leg,
+            irreversible,
+        } => {
+            let spec = jit::SecretGrantSpec {
+                id,
+                audience,
+                scope,
+                secret_arn,
+                json_key,
+                max_ttl_secs: max_ttl,
+                leg: parse_leg(&leg)?,
+                irreversible,
+            };
+            print_outcome(Artifact::Grants, &jit::add_secret(dir, spec, dry)?, color);
+        }
+        JitCmd::SetTtl { id, secs } => {
+            print_outcome(Artifact::Grants, &jit::set_ttl(dir, &id, secs, dry)?, color);
+        }
+        JitCmd::Rm { id } => {
+            if confirm(&format!("remove grant '{id}'?"), yes)? {
+                print_outcome(Artifact::Grants, &jit::rm(dir, &id, dry)?, color);
+            }
         }
     }
     Ok(())

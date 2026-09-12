@@ -4,6 +4,7 @@
 pub mod broker;
 pub mod egress;
 pub mod honeypot;
+pub mod jit;
 pub mod meter;
 pub mod sandbox;
 pub mod supply;
@@ -47,6 +48,7 @@ pub fn edit_seed(dir: &PolicyDir, artifact: Artifact) -> Result<String> {
         Artifact::Pins => supply::show(dir, Format::Json),
         Artifact::Honeypots => honeypot::show(dir, Format::Json),
         Artifact::Sandbox => sandbox::show(dir, Format::Toml),
+        Artifact::Grants => jit::show(dir, Format::Toml),
     }
 }
 

@@ -108,6 +108,15 @@ pub fn load_sandbox_policy(policy_dir: &Path) -> aegis_sandbox::SandboxPolicy {
     }
 }
 
+/// Load the JIT grant catalog from `grants.toml`. An absent or malformed file yields the empty
+/// catalog — which denies every credential request (safe by default), mirroring the sandbox loader.
+pub fn load_grant_catalog(policy_dir: &Path) -> aegis_jit::GrantCatalog {
+    match std::fs::read_to_string(policy_dir.join("grants.toml")) {
+        Ok(src) => aegis_jit::GrantCatalog::from_toml(&src).unwrap_or_default(),
+        Err(_) => aegis_jit::GrantCatalog::default(),
+    }
+}
+
 /// Load the honeypot decoys/canaries from `<dir>/honeypots.json`, or an empty set when absent or
 /// unparseable (§11, ASI05/ASI08). An empty set is inert — nothing to trip — so a deployment has
 /// zero false positives until decoys/canaries are deliberately configured.

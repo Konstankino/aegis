@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::artifacts::Artifact;
-use crate::domains::{broker, egress, honeypot, meter, sandbox, supply};
+use crate::domains::{broker, egress, honeypot, jit, meter, sandbox, supply};
 use crate::io::{self, PolicyDir};
 use crate::validate::{self, Status};
 use crate::{testrun, Format};
@@ -285,6 +285,7 @@ fn detail_for(dir: &PolicyDir, a: Artifact) -> Result<String> {
         Artifact::Pins => supply::show(dir, Format::Text)?,
         Artifact::Honeypots => honeypot::show(dir, Format::Text)?,
         Artifact::Sandbox => sandbox::show(dir, Format::Text)?,
+        Artifact::Grants => jit::show(dir, Format::Text)?,
     })
 }
 
