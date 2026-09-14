@@ -27,6 +27,9 @@ aegis-honeypot = { workspace = true }
 aegis-intent = { workspace = true }
 aegis-identity = { workspace = true }
 aegis-jit = { workspace = true }
+aegis-trace = { workspace = true }
+aegis-eval = { workspace = true }
+uuid = { workspace = true }
 lambda-extension = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }

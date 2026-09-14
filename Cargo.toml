@@ -5,6 +5,7 @@
 resolver = "2"
 members = [
     "crates/aegis-core",
+    "crates/aegis-trace",
     "crates/aegis-broker",
     "crates/aegis-output",
     "crates/aegis-egress",
@@ -17,11 +18,14 @@ members = [
     "crates/aegis-mesh",
     "crates/aegis-identity",
     "crates/aegis-jit",
+    "crates/aegis-prompt",
     "crates/aegis-intent",
     "crates/aegis-sandbox",
     "crates/aegis-killswitch",
     "crates/aegis-honeypot",
     "crates/aegis-redteam",
+    "crates/aegis-eval",
+    "crates/aegis-gateway",
     "crates/aegis-extension",
     "crates/aegis-cli",
 ]
@@ -36,6 +40,7 @@ rust-version = "1.96"
 # concepts are stable but APIs drift between releases — pin and verify).
 [workspace.dependencies]
 aegis-core = { path = "crates/aegis-core" }
+aegis-trace = { path = "crates/aegis-trace" }
 aegis-broker = { path = "crates/aegis-broker" }
 aegis-output = { path = "crates/aegis-output" }
 aegis-egress = { path = "crates/aegis-egress" }
@@ -48,10 +53,13 @@ aegis-redact = { path = "crates/aegis-redact" }
 aegis-mesh = { path = "crates/aegis-mesh" }
 aegis-identity = { path = "crates/aegis-identity" }
 aegis-jit = { path = "crates/aegis-jit" }
+aegis-prompt = { path = "crates/aegis-prompt" }
 aegis-intent = { path = "crates/aegis-intent" }
 aegis-sandbox = { path = "crates/aegis-sandbox" }
 aegis-killswitch = { path = "crates/aegis-killswitch" }
 aegis-honeypot = { path = "crates/aegis-honeypot" }
+aegis-eval = { path = "crates/aegis-eval" }
+aegis-gateway = { path = "crates/aegis-gateway" }
 
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -60,6 +68,9 @@ sha2 = "0.10"
 unicode-normalization = "0.1.25"
 regex = "1.13.1"
 ed25519-dalek = "2"
+# UUID identifiers for the trace spine (TraceId/SpanId), Roadmap T0. v5 = deterministic,
+# name-based ids so the gate can derive a stable TraceId from a thread id.
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 cedar-policy = "4.12.0"
 jsonschema = "0.52.1"
 url = "2.5.8"

@@ -19,7 +19,8 @@ it mitigates, fully or partially. The two files are kept in sync — when a crat
 
 | Crate | Primary role | LLM Top-10 (2025) | Agentic ASI Top-10 (2026) | Tier |
 |---|---|---|---|---|
-| `aegis-core` | Trust vocabulary — provenance labels, capability/Rule-of-Two tags, shared types | — | — | — |
+| `aegis-core` | Trust vocabulary — provenance labels, capability/Rule-of-Two tags, shared types (+ `TenantId`, `PolicyDecision`, `Owasp`) | — | — | — |
+| `aegis-trace` *(T0)* | Observability spine — typed `Trace`/`Span`, pluggable `TraceCollector`, non-blocking `SpanEmitter` | — | — | — |
 | `aegis-broker` | Capability mediator / deterministic policy engine (Cedar) | **LLM01**, **LLM03**, **LLM07**, LLM02, LLM08 | **ASI02**, ASI01, ASI03, ASI05, ASI08, ASI09, ASI10 | ● |
 | `aegis-output` | Output schema validation + sink-specific encoding | **LLM02**, **LLM10**, LLM01, LLM07 | ASI02, ASI05, ASI09 | ● |
 | `aegis-egress` | Network egress firewall / exfiltration broker | **LLM01**, **LLM02**, **LLM06** | ASI02, ASI05 | ● |
@@ -30,9 +31,12 @@ it mitigates, fully or partially. The two files are kept in sync — when a crat
 | `aegis-redact` | Disclosure / redaction filter for outputs and traces | **LLM02**, **LLM08** | ASI06 | ◐/● |
 | `aegis-ledger` | Tamper-evident audit + memory-write gating | **LLM02**, **LLM03**, **LLM05** | ASI01, ASI03, ASI06, ASI08, ASI09, ASI10 | ● |
 | `aegis-redteam` | Adaptive attack harness (release gate) | **LLM01** (all, as a gate) | ASI08 (digital-twin replay gate) | ○ |
+| `aegis-eval` *(T3)* | Evaluation harness — `Evaluator` trait, deterministic `PhiLeakEvaluator`, threshold aggregation, golden sets | **LLM02** (PHI leak, measured), LLM07, LLM09 | — | ● |
+| `aegis-gateway` *(T4)* | Edge gateway core — hashed API-key auth, per-key rate limiter, MCP JSON-RPC 2.0 adapter. Transport only; security stays in the pipeline | — | — | — |
 | `aegis-mesh` *(§11)* | Secure inter-agent communication (mTLS, signing, anti-replay, attested registry) | — | **ASI07**, ASI03, ASI04, ASI10 | ● |
 | `aegis-identity` *(§11)* | Per-agent identity + delegation control + JIT scoped credentials | — | **ASI03**, ASI10 | ● |
 | `aegis-jit` *(§11)* | JIT credential broker: exchange a validated identity credential for a short-lived, scoped STS session / just-in-time secret | — | **ASI03**, **ASI06** | ● |
+| `aegis-prompt` *(T2)* | Prompt supply: versioned/hashed `PromptRegistry`, delimited `ContextWindow` builder, per-tenant approved-`ModelRouter` | **LLM07**, LLM03 | **ASI04** | ● |
 | `aegis-intent` *(§11)* | Signed goal/intent envelope per execution cycle + goal-drift | — | **ASI01** | ● |
 | `aegis-sandbox` *(§11)* | Isolated, non-root, ephemeral code-execution environment | — | **ASI05**, ASI10 | ● |
 | `aegis-killswitch` *(§11)* | Emergency revocation + quarantine + gated reintegration | — | **ASI04**, **ASI08**, **ASI10** | ● |

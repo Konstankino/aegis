@@ -1,0 +1,13 @@
+[package]
+name = "aegis-prompt"
+description = "Aegis prompt supply (Roadmap T2): versioned prompt registry, structured context-window builder, approved-model routing."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aegis-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }

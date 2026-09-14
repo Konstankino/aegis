@@ -1,0 +1,13 @@
+[package]
+name = "aegis-trace"
+description = "Aegis observability spine: typed Trace/Span, pluggable TraceCollector, non-blocking SpanEmitter (Roadmap T0)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aegis-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

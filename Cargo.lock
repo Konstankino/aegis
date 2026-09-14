@@ -68,12 +68,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "aegis-eval"
+version = "0.1.0"
+dependencies = [
+ "aegis-core",
+ "aegis-redact",
+ "aegis-trace",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aegis-extension"
 version = "0.1.0"
 dependencies = [
  "aegis-broker",
  "aegis-core",
  "aegis-egress",
+ "aegis-eval",
  "aegis-honeypot",
  "aegis-identity",
  "aegis-ingress",
@@ -87,6 +99,7 @@ dependencies = [
  "aegis-retrieval",
  "aegis-sandbox",
  "aegis-supply",
+ "aegis-trace",
  "aws-config",
  "aws-sdk-dynamodb",
  "aws-sdk-s3",
@@ -107,6 +120,17 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "aegis-gateway"
+version = "0.1.0"
+dependencies = [
+ "aegis-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -208,6 +232,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aegis-prompt"
+version = "0.1.0"
+dependencies = [
+ "aegis-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "aegis-redact"
 version = "0.1.0"
 dependencies = [
@@ -268,6 +302,16 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+]
+
+[[package]]
+name = "aegis-trace"
+version = "0.1.0"
+dependencies = [
+ "aegis-core",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -4052,6 +4096,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4940,7 +4990,10 @@ version = "1.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5772d71c9be8a8a6ac2117d949c5b224c1b72241bb611d9a3012edcf8af7812"
 dependencies = [
+ "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 

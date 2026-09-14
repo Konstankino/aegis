@@ -231,6 +231,30 @@ impl Credential {
     }
 }
 
+/// Map into the plane-wide [`PolicyDecision`](aegis_core::PolicyDecision) vocabulary (Roadmap T0).
+impl From<AuthDecision> for aegis_core::PolicyDecision {
+    fn from(d: AuthDecision) -> Self {
+        match d {
+            AuthDecision::Allow => aegis_core::PolicyDecision::Allow,
+            AuthDecision::Deny(reason) => aegis_core::PolicyDecision::deny(reason),
+        }
+    }
+}
+
+#[cfg(test)]
+mod policy_decision_adapter_tests {
+    use super::*;
+    #[test]
+    fn maps_into_policy_decision() {
+        use aegis_core::PolicyDecision;
+        assert!(PolicyDecision::from(AuthDecision::Allow).is_allow());
+        assert_eq!(
+            PolicyDecision::from(AuthDecision::Deny("expired")).reason(),
+            Some("expired")
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

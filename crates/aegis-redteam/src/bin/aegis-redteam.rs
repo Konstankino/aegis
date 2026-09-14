@@ -11,6 +11,12 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // `--coverage` emits the generated OWASP compliance matrix and exits (Roadmap T5).
+    if std::env::args().any(|a| a == "--coverage") {
+        print!("{}", aegis_redteam::coverage::matrix_markdown());
+        return ExitCode::SUCCESS;
+    }
+
     let json = std::env::args().any(|a| a == "--json");
     let report = aegis_redteam::run_suite(&aegis_redteam::default_suite());
 

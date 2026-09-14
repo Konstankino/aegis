@@ -29,6 +29,9 @@ pub struct PolicyEngine {
 pub struct PolicyPrincipal<'a> {
     /// The agent's stable identity (the Cedar principal id).
     pub agent_id: &'a str,
+    /// The tenant this session belongs to (Roadmap T1). Exposed as `context.tenant` so policies can
+    /// scope per-tenant ACLs; defaults to `"default"` for single-tenant deployments.
+    pub tenant: &'a str,
     /// The session's accumulated Rule-of-Two capability taint.
     pub cap: Capability,
 }
@@ -71,6 +74,7 @@ impl PolicyEngine {
             "active_legs": i64::from(principal.cap.active_legs()),
             "consequence": consequence_str(consequence),
             "arg_provenance": provenance_str(call.arg_provenance),
+            "tenant": principal.tenant,
         });
         let context = Context::from_json_value(ctx_json, None)
             .map_err(|e| AegisError::Policy(format!("cannot build request context: {e}")))?;
@@ -128,8 +132,35 @@ mod tests {
     fn principal() -> PolicyPrincipal<'static> {
         PolicyPrincipal {
             agent_id: "agent",
+            tenant: "default",
             cap: Capability::NONE,
         }
+    }
+
+    #[test]
+    fn per_tenant_policy_scopes_by_context_tenant() {
+        // A per-tenant ACL: only tenant "acme" may invoke.
+        let engine = PolicyEngine::from_cedar(
+            r#"permit ( principal, action, resource ) when { context.tenant == "acme" };"#,
+        )
+        .unwrap();
+        let call = ToolCall::new("t", serde_json::json!({}), Provenance::User);
+        let acme = PolicyPrincipal {
+            agent_id: "a",
+            tenant: "acme",
+            cap: Capability::NONE,
+        };
+        let other = PolicyPrincipal {
+            agent_id: "a",
+            tenant: "other",
+            cap: Capability::NONE,
+        };
+        assert!(engine
+            .is_authorized(&acme, &call, false, false, Consequence::LowReversible)
+            .unwrap());
+        assert!(!engine
+            .is_authorized(&other, &call, false, false, Consequence::LowReversible)
+            .unwrap());
     }
 
     #[test]

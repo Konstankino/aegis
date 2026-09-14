@@ -26,7 +26,8 @@ This workspace implements the full LLM roadmap (§5) — **Phase 0** (consequenc
 
 | Crate | Role | OWASP | Tier | Phase |
 |---|---|---|---|---|
-| [`aegis-core`](crates/aegis-core) | Shared trust vocabulary: `Provenance`, `Tagged<T>`, `Capability` (Rule of Two) | — | — | 0 |
+| [`aegis-core`](crates/aegis-core) | Shared trust vocabulary: `Provenance`, `Tagged<T>`, `Capability` (Rule of Two), `TenantId`/`PolicyDecision`/`Owasp` | — | — | 0 |
+| [`aegis-trace`](crates/aegis-trace) | Observability spine: typed `Trace`/`Span`, pluggable `TraceCollector`, non-blocking `SpanEmitter` | — | — | T0 |
 | [`aegis-broker`](crates/aegis-broker) | **Keystone (priority #1).** Deterministic tool-call mediation with a Cedar policy core | LLM03 | ● | 0 |
 | [`aegis-output`](crates/aegis-output) | Strict schema validation + context-aware sink encoding + exfil neutralization | LLM10 | ● | 0 |
 | [`aegis-egress`](crates/aegis-egress) | Default-deny egress allowlist + query stripping, with an axum proxy | LLM02/06 | ● | 0 |
@@ -37,9 +38,12 @@ This workspace implements the full LLM roadmap (§5) — **Phase 0** (consequenc
 | [`aegis-supply`](crates/aegis-supply) | Artifact digest pinning, mutable-tag rejection, namespace-reuse + SBOM gating | LLM04/05 | ● | 2 |
 | [`aegis-redact`](crates/aegis-redact) | PII/secret redaction of outputs, reasoning traces, and tool-call args | LLM02/08 | ◐/● | 2 |
 | [`aegis-redteam`](crates/aegis-redteam) | Adaptive attack harness that runs the whole defense and gates CI | LLM01–10, ASI | ○ | 3 |
+| [`aegis-eval`](crates/aegis-eval) | Evaluation harness: `Evaluator` trait, deterministic `PhiLeakEvaluator`, threshold aggregation, golden sets | LLM02/07/09 | ● | T3 |
 | [`aegis-mesh`](crates/aegis-mesh) | Secure inter-agent comms: signing, anti-replay, protocol pinning, attested registry | ASI07 | ● | §11 |
 | [`aegis-identity`](crates/aegis-identity) | Per-agent identity + JIT scoped credentials + delegation control | ASI03 | ● | §11 |
 | [`aegis-jit`](crates/aegis-jit) | JIT credential broker: exchange an identity credential for a short-lived, scoped STS session / secret ([guide](docs/jit-credentials.md)) | ASI03/06 | ● | §11 |
+| [`aegis-prompt`](crates/aegis-prompt) | Prompt supply: versioned prompt registry, structured context-window builder, approved-model routing | LLM03/07, ASI04 | ● | T2 |
+| [`aegis-gateway`](crates/aegis-gateway) | Edge gateway core: hashed API-key auth, per-key rate limiting, MCP JSON-RPC 2.0 adapter (transport only) | — | — | T4 |
 | [`aegis-intent`](crates/aegis-intent) | Signed goal/intent envelope bound per cycle + goal-drift | ASI01 | ● | §11 |
 | [`aegis-sandbox`](crates/aegis-sandbox) | Isolated code-execution policy (non-root, ephemeral, gate-before-exec) | ASI05 | ● | §11 |
 | [`aegis-killswitch`](crates/aegis-killswitch) | Emergency revocation + quarantine + gated reintegration | ASI08/10 | ● | §11 |

@@ -27,6 +27,7 @@ mod plane;
 mod s3;
 mod session_store;
 mod telemetry;
+mod trace_sink;
 
 use std::sync::Arc;
 
@@ -131,6 +132,9 @@ async fn main() -> Result<(), Error> {
 
     let gate_config = gate::GateConfig {
         limits: plane::load_meter_limits(&plane::policy_dir()),
+        // Per-tenant meter budgets (Roadmap T1): none configured yet, so every tenant uses the
+        // default limits above. A future loader can populate this from per-tenant config.
+        tenant_limits: std::collections::HashMap::new(),
         pinset: plane::load_pinset(&plane::policy_dir()),
         sandbox: plane::load_sandbox_policy(&plane::policy_dir()),
         grants: plane::load_grant_catalog(&plane::policy_dir()),

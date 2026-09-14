@@ -335,6 +335,38 @@ pub fn decide(
     }
 }
 
+/// Map into the plane-wide [`PolicyDecision`](aegis_core::PolicyDecision) vocabulary (Roadmap T0).
+/// `Grant` is an allow; `HumanApprove` an escalation; `Deny` carries its reason.
+impl From<JitDecision> for aegis_core::PolicyDecision {
+    fn from(d: JitDecision) -> Self {
+        match d {
+            JitDecision::Grant { .. } => aegis_core::PolicyDecision::Allow,
+            JitDecision::HumanApprove(reason) => aegis_core::PolicyDecision::escalate(reason),
+            JitDecision::Deny(reason) => aegis_core::PolicyDecision::deny(reason),
+        }
+    }
+}
+
+#[cfg(test)]
+mod policy_decision_adapter_tests {
+    use super::*;
+    #[test]
+    fn maps_into_policy_decision() {
+        use aegis_core::{Capability, Consequence, PolicyDecision};
+        let grant = JitDecision::Grant {
+            ttl_secs: 60,
+            legs: Capability::NONE,
+            consequence: Consequence::LowReversible,
+        };
+        assert!(PolicyDecision::from(grant).is_allow());
+        assert!(PolicyDecision::from(JitDecision::HumanApprove("trifecta")).is_escalate());
+        assert_eq!(
+            PolicyDecision::from(JitDecision::Deny("no grant")).reason(),
+            Some("no grant")
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

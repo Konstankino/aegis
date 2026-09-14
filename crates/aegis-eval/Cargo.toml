@@ -1,0 +1,18 @@
+[package]
+name = "aegis-eval"
+description = "Aegis evaluation harness (Roadmap T3): pluggable evaluators, deterministic PHI-leak scoring, golden sets, threshold aggregation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "aegis-eval"
+path = "src/main.rs"
+
+[dependencies]
+aegis-core = { workspace = true }
+aegis-trace = { workspace = true }
+aegis-redact = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

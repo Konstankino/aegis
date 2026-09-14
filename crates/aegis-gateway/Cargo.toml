@@ -1,0 +1,13 @@
+[package]
+name = "aegis-gateway"
+description = "Aegis edge gateway core (Roadmap T4): hashed API-key auth, per-key rate limiting, and an MCP JSON-RPC 2.0 adapter. Transport only — the security stays in the pipeline."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aegis-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }

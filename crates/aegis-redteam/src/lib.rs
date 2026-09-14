@@ -296,6 +296,18 @@ pub fn default_suite() -> Vec<Attack> {
             description: "A drifting agent's tool must be revocable instantly",
             run: attack_rogue_agent_revocation,
         },
+        Attack {
+            name: "tenant-killswitch-isolation",
+            category: Asi08CascadingFailures,
+            description: "Revoking one tenant must halt that tenant only, never a neighbor",
+            run: attack_tenant_killswitch_isolation,
+        },
+        Attack {
+            name: "global-killswitch-halt",
+            category: Asi08CascadingFailures,
+            description: "The global stop must refuse every tenant instantly and lift cleanly",
+            run: attack_global_killswitch_halt,
+        },
     ]
 }
 
@@ -739,6 +751,35 @@ fn attack_rogue_agent_revocation() -> AttackOutcome {
     }
 }
 
+fn attack_tenant_killswitch_isolation() -> AttackOutcome {
+    // T1: a compromised tenant must be haltable without collateral damage to a neighbor.
+    let mut ks = aegis_killswitch::Killswitch::new();
+    ks.revoke(aegis_killswitch::Target::Tenant("acme".into()));
+    let acme_halted = ks.blocks("acme", Some("a1"), Some("db.write")).is_some();
+    let neighbor_ok = ks.blocks("other", Some("a1"), Some("db.write")).is_none();
+    if acme_halted && neighbor_ok {
+        AttackOutcome::contained("tenant killswitch halted only the revoked tenant")
+    } else {
+        AttackOutcome::breached("tenant killswitch leaked across tenants or failed to halt")
+    }
+}
+
+fn attack_global_killswitch_halt() -> AttackOutcome {
+    // ASI08: the global stop must refuse every tenant/agent instantly, and lift cleanly.
+    let mut ks = aegis_killswitch::Killswitch::new();
+    ks.revoke(aegis_killswitch::Target::Global);
+    let all_halted = ["acme", "other", "clinic-7"]
+        .iter()
+        .all(|t| ks.blocks(t, Some("a"), None).is_some());
+    ks.restore(&aegis_killswitch::Target::Global);
+    let restored = ks.blocks("acme", Some("a"), None).is_none();
+    if all_halted && restored {
+        AttackOutcome::contained("global killswitch halted every tenant and lifted cleanly")
+    } else {
+        AttackOutcome::breached("global killswitch failed to halt or restore")
+    }
+}
+
 // ── Digital-twin replay (§11.1): a pre-deployment cascade gate ───────────────────────────────
 //
 // A "digital twin" is a recorded golden run (a sequence of tool-call requests with the decision
@@ -854,9 +895,186 @@ pub fn default_twin() -> DigitalTwin {
     }
 }
 
+// ── Compliance evidence: the OWASP coverage matrix (Roadmap T5) ───────────────────────────────
+//
+// Generated from typed crate metadata + the `aegis_core::Owasp` enum, so the artifact a client
+// hands their compliance team is derived from the code, not hand-maintained. A test asserts
+// **every** OWASP risk has a covering crate, so the matrix can never silently miss a risk.
+
+/// The compliance coverage matrix — one row per OWASP risk, naming the crate(s) that mitigate it.
+pub mod coverage {
+    use aegis_core::Owasp;
+
+    /// The defensive tier a control provides (architecture-considerations.md).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Tier {
+        /// Deterministic containment — the consequence is bounded by code that behaves the same
+        /// every time and does not degrade under adaptive attack.
+        Contain,
+        /// Reduces attack success but is never the last line.
+        Reduce,
+        /// A process/governance residual, not code-fixable.
+        Process,
+    }
+
+    impl Tier {
+        /// The glyph used in the matrix (`●`/`◐`/`○`).
+        #[must_use]
+        pub fn glyph(self) -> &'static str {
+            match self {
+                Tier::Contain => "●",
+                Tier::Reduce => "◐",
+                Tier::Process => "○",
+            }
+        }
+        /// The word form.
+        #[must_use]
+        pub fn label(self) -> &'static str {
+            match self {
+                Tier::Contain => "Contain",
+                Tier::Reduce => "Reduce",
+                Tier::Process => "Process",
+            }
+        }
+    }
+
+    /// One risk's coverage: the crate(s) that mitigate it, a one-line how, and the tier.
+    pub struct CoverageRow {
+        /// The OWASP risk.
+        pub risk: Owasp,
+        /// The crate(s) that mitigate it.
+        pub crates: &'static [&'static str],
+        /// One line on how it is mitigated.
+        pub how: &'static str,
+        /// The strongest tier the covering crates provide.
+        pub tier: Tier,
+    }
+
+    fn row(
+        risk: Owasp,
+        crates: &'static [&'static str],
+        how: &'static str,
+        tier: Tier,
+    ) -> CoverageRow {
+        CoverageRow {
+            risk,
+            crates,
+            how,
+            tier,
+        }
+    }
+
+    /// The full coverage set — exactly one row per [`Owasp`] risk.
+    #[must_use]
+    pub fn coverage() -> Vec<CoverageRow> {
+        use Owasp::*;
+        use Tier::{Contain, Reduce};
+        vec![
+            row(Llm01, &["aegis-ingress", "aegis-retrieval", "aegis-broker"],
+                "Unicode hygiene + retrieval scan up front; the broker never asks the model whether to act", Contain),
+            row(Llm02, &["aegis-output", "aegis-redact", "aegis-egress"],
+                "Sink encoding + deterministic PII/secret redaction + default-deny egress", Contain),
+            row(Llm03, &["aegis-supply"],
+                "Model/artifact digest pinning; mutable-tag and namespace-reuse rejection", Contain),
+            row(Llm04, &["aegis-retrieval"],
+                "Ingestion gate scans documents for injection before they enter the vector store", Reduce),
+            row(Llm05, &["aegis-output"],
+                "Strict schema validation + context-aware sink encoding of every output", Contain),
+            row(Llm06, &["aegis-broker"],
+                "Rule-of-Two capability trifecta; the lethal trifecta is never auto-approved", Contain),
+            row(Llm07, &["aegis-output", "aegis-honeypot", "aegis-eval"],
+                "Canary tokens planted + scanned; the eval forbidden-term check flags leakage", Contain),
+            row(Llm08, &["aegis-retrieval"],
+                "Trust-tier segregation, two-factor retrieval, embedding-version tracking", Reduce),
+            row(Llm09, &["aegis-eval"],
+                "Faithfulness / medical-accuracy LLM-judges score the answer against its context", Reduce),
+            row(Llm10, &["aegis-meter"],
+                "Token/cost governor + agentic circuit breaker with per-tenant budgets", Contain),
+            row(Asi01, &["aegis-ingress", "aegis-intent", "aegis-retrieval"],
+                "Signed intent capsule + goal-drift detection; untrusted content is sanitized", Contain),
+            row(Asi02, &["aegis-broker", "aegis-egress"],
+                "Every tool call mediated by Cedar policy; outbound calls hit the allowlist", Contain),
+            row(Asi03, &["aegis-identity", "aegis-jit", "aegis-broker"],
+                "Per-agent scoped credentials, narrow-only delegation, JIT short-lived cloud creds", Contain),
+            row(Asi04, &["aegis-supply", "aegis-retrieval"],
+                "Digest pinning + ingestion scanning catch poisoned artifacts and documents", Contain),
+            row(Asi05, &["aegis-sandbox", "aegis-egress"],
+                "Code runs only after the generation→execution gate; egress allowlist caps reach", Contain),
+            row(Asi06, &["aegis-ledger", "aegis-jit"],
+                "Tamper-evident memory-write gating + trust decay; JIT creds bound to intent", Contain),
+            row(Asi07, &["aegis-mesh"],
+                "Mutual auth, anti-replay, protocol pinning, intent-diffing on peer messages", Contain),
+            row(Asi08, &["aegis-meter", "aegis-killswitch"],
+                "Circuit breaker contains a failing backend; tenant/global kill switch halts cascades", Contain),
+            row(Asi09, &["aegis-output", "aegis-ledger"],
+                "Output confidence gating and an immutable audit trail bound trust exploitation", Reduce),
+            row(Asi10, &["aegis-killswitch"],
+                "Instant revocation + quarantine; reintegration needs fresh attestation AND a human", Contain),
+        ]
+    }
+
+    /// Render the coverage set as a Markdown table — the generated compliance-evidence doc.
+    #[must_use]
+    pub fn matrix_markdown() -> String {
+        let mut out = String::from(
+            "# Aegis — OWASP coverage matrix (generated)\n\n\
+             Generated from `aegis_redteam::coverage` + the `aegis_core::Owasp` enum. Every risk below \
+             has at least one covering crate; a red-team test enforces that this stays true.\n\n\
+             | Risk | Name | Crates | How | Tier |\n\
+             |---|---|---|---|---|\n",
+        );
+        for r in coverage() {
+            let crates = r
+                .crates
+                .iter()
+                .map(|c| format!("`{c}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "| `{}` | {} | {} | {} | {} {} |\n",
+                r.risk.code(),
+                r.risk.title(),
+                crates,
+                r.how,
+                r.tier.glyph(),
+                r.tier.label(),
+            ));
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coverage_matrix_covers_every_owasp_risk() {
+        use aegis_core::Owasp;
+        let rows = coverage::coverage();
+        // Compliance guarantee: every OWASP risk has a covering crate + a non-empty "how".
+        for risk in Owasp::ALL {
+            let r = rows
+                .iter()
+                .find(|r| r.risk == risk)
+                .unwrap_or_else(|| panic!("OWASP {} is not covered", risk.code()));
+            assert!(!r.crates.is_empty(), "{} names no crate", risk.code());
+            assert!(!r.how.trim().is_empty(), "{} has no how", risk.code());
+        }
+        // Exactly one row per risk (no gaps, no duplicates).
+        assert_eq!(rows.len(), Owasp::ALL.len());
+        // The generated Markdown names every risk code.
+        let md = coverage::matrix_markdown();
+        for risk in Owasp::ALL {
+            assert!(md.contains(risk.code()), "matrix omits {}", risk.code());
+        }
+    }
+
+    #[test]
+    fn tenant_and_global_killswitch_attacks_are_contained() {
+        assert!(attack_tenant_killswitch_isolation().contained);
+        assert!(attack_global_killswitch_halt().contained);
+    }
 
     #[test]
     fn digital_twin_replay_matches_the_golden_run() {

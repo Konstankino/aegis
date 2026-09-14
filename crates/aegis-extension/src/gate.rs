@@ -39,12 +39,13 @@ use crate::session_store::{SessionStore, StoreResult};
 
 use aegis_broker::registry::ToolCall;
 use aegis_broker::{Broker, Decision, Session};
-use aegis_core::{Capability, Provenance};
+use aegis_core::{Capability, Owasp, PolicyDecision, Provenance, TenantId};
 use aegis_ledger::{gate_memory_write, EntryKind, Ledger};
 use aegis_meter::{Limits, Meter, Verdict};
 use aegis_output::{encode, Sink};
 use aegis_retrieval::{authorize_query, QueryRequest, RetrievalContext};
 use aegis_supply::{Digest, Pinset};
+use aegis_trace::{Span, SpanEmitter, Stage, TraceId};
 // Agentic/ASI controls (§11): emergency revocation, sandbox exec policy, intent envelope, honeypots.
 use aegis_honeypot::Honeypots;
 use aegis_identity::{Credential, RequestContext};
@@ -64,8 +65,11 @@ use serde::Deserialize;
 /// Static configuration for the gate (loaded once at boot from the policy artifacts + env).
 #[derive(Clone, Default)]
 pub struct GateConfig {
-    /// Meter budget limits (Phase 1).
+    /// Default meter budget limits (Phase 1) — used for any tenant without an explicit override.
     pub limits: Limits,
+    /// Per-tenant meter budget overrides (Roadmap T1). A tenant absent here uses [`limits`]. Empty
+    /// by default, so single-tenant deployments are unaffected.
+    pub tenant_limits: HashMap<TenantId, Limits>,
     /// Immutable S3 sink for audit-ledger entries, if configured (`AEGIS_LEDGER_BUCKET`).
     pub ledger_bucket: Option<String>,
     /// Supply-chain digest pinset (Phase 2).
@@ -83,6 +87,16 @@ pub struct GateConfig {
     /// in-memory-only behaviour). Set from `AEGIS_CHECKPOINT_TABLE` in production (feature
     /// `dynamodb`).
     pub store: Option<Arc<SessionStore>>,
+}
+
+impl GateConfig {
+    /// The meter limits for a tenant: its override if present, else the default (Roadmap T1).
+    fn limits_for(&self, tenant: &TenantId) -> Limits {
+        self.tenant_limits
+            .get(tenant)
+            .cloned()
+            .unwrap_or_else(|| self.limits.clone())
+    }
 }
 
 /// Shared state for the gate: the compiled broker + config, plus the per-thread session / meter
@@ -103,10 +117,32 @@ struct GateState {
     // Agents whose durable quarantine this process has already consulted, so the store is read at
     // most once per agent per cold environment rather than on every mediation.
     quarantine_checked: Arc<Mutex<HashSet<String>>>,
+    // Non-blocking typed-span emitter (Roadmap T0): each gate decision is recorded as a `Span` into
+    // a `Trace` keyed by the thread id, forwarded to the trace collector on a background thread.
+    emitter: SpanEmitter,
 }
 
 /// Build the gate router. Returned fully-stated so it can be `.merge()`d with the egress router.
+///
+/// Spawns the typed-span drain (Roadmap T0) feeding [`TracingCollector`](crate::trace_sink::
+/// TracingCollector); the drain thread is detached and lives for the process. Tests use
+/// [`router_with_emitter`] to inspect emitted spans.
 pub fn router(broker: Arc<Broker>, config: GateConfig) -> Router {
+    // 4096 buffered spans: generous headroom; a burst that overruns it drops spans rather than
+    // stalling the request path (the emitter counts drops).
+    let (emitter, handle) = SpanEmitter::spawn(crate::trace_sink::TracingCollector, 4096);
+    // Detach: the drain thread runs for the life of the process, draining as spans arrive.
+    drop(handle);
+    router_with_emitter(broker, config, emitter)
+}
+
+/// Build the gate router with a caller-supplied [`SpanEmitter`], so a test can wire an
+/// `InMemoryCollector` and assert on the spans the gate emits.
+pub fn router_with_emitter(
+    broker: Arc<Broker>,
+    config: GateConfig,
+    emitter: SpanEmitter,
+) -> Router {
     // The durable store (or the no-op Null store when none is configured).
     let store = config.store.clone().unwrap_or_else(SessionStore::null);
     let state = GateState {
@@ -118,6 +154,7 @@ pub fn router(broker: Arc<Broker>, config: GateConfig) -> Router {
         killswitch: Arc::new(Mutex::new(Killswitch::new())),
         store,
         quarantine_checked: Arc::new(Mutex::new(HashSet::new())),
+        emitter,
     };
     Router::new()
         // Phase 0/1/2.
@@ -137,6 +174,7 @@ pub fn router(broker: Arc<Broker>, config: GateConfig) -> Router {
         .route("/sandbox/validate", post(sandbox_validate))
         .route("/intent/validate", post(intent_validate))
         .route("/credentials/issue", post(credentials_issue))
+        .route("/output/scan", post(output_scan))
         .with_state(state)
 }
 
@@ -145,6 +183,43 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Derive a stable [`TraceId`] from the thread id (UUID v5), so every span for a thread groups into
+/// one trace even across handlers and cold restarts. (Tenancy is Roadmap T1; the tenant is the
+/// default until then.)
+fn trace_id_for(thread_id: &str) -> TraceId {
+    TraceId::from_uuid(uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        thread_id.as_bytes(),
+    ))
+}
+
+/// Build a [`PolicyDecision`] from a handler's already-reduced string verdict + optional reason.
+fn policy_from(verdict: &str, reason: &Option<String>) -> PolicyDecision {
+    match verdict {
+        "allow" => PolicyDecision::Allow,
+        "human_approve" => PolicyDecision::escalate("requires human approval"),
+        _ => match reason {
+            Some(r) => PolicyDecision::Deny(std::borrow::Cow::Owned(r.clone())),
+            None => PolicyDecision::deny("denied"),
+        },
+    }
+}
+
+/// Emit one gate span, best-effort and non-blocking (a full buffer drops it, never stalls the
+/// request). Keyed by the thread's derived trace id and tagged with the tenant.
+fn emit_span(st: &GateState, thread_id: &str, tenant: &TenantId, span: Span) {
+    st.emitter.emit(&trace_id_for(thread_id), tenant, span);
+}
+
+/// Resolve the request's tenant (Roadmap T1): absent/empty ⇒ the default tenant; a present but
+/// malformed id fails closed (`Err`), so the caller denies rather than silently cross-tenant.
+fn tenant_of(raw: &Option<String>) -> Result<TenantId, &'static str> {
+    match raw.as_deref() {
+        None | Some("") => Ok(TenantId::default()),
+        Some(s) => TenantId::new(s).map_err(|_| "invalid tenant id"),
+    }
 }
 
 /// A stable hash of a tool call's identity + arguments, for loop detection.
@@ -166,6 +241,9 @@ struct MediateRequest {
     args: serde_json::Value,
     #[serde(default)]
     arg_provenance: Option<Provenance>,
+    /// The tenant this request belongs to (Roadmap T1). Absent ⇒ the default tenant.
+    #[serde(default)]
+    tenant: Option<String>,
 }
 
 #[tracing::instrument(
@@ -186,6 +264,15 @@ async fn mediate(
     let prov = req.arg_provenance.unwrap_or(Provenance::Untrusted);
     let key = req.thread_id.clone();
     let loop_hash = state_hash(&req.tool, &req.args);
+
+    // Resolve the tenant (Roadmap T1). A malformed id fails closed rather than defaulting.
+    let tenant = match tenant_of(&req.tenant) {
+        Ok(t) => t,
+        Err(reason) => {
+            crate::telemetry::record_decision("deny", false);
+            return Json(serde_json::json!({ "decision": "deny", "reason": reason }));
+        }
+    };
 
     // Canary tripwire (ASI08, honeypot Phase B): a planted canary token appearing in the tool-call
     // arguments is proof of exfiltration. Record it immutably, quarantine the agent, and refuse the
@@ -226,7 +313,7 @@ async fn mediate(
     // this thread's Rule-of-Two taint + meter budget from the store BEFORE any decision, and seed
     // the killswitch from any durable quarantine for this agent. Both fail CLOSED — a configured
     // store that cannot be read denies rather than proceed with reset taint.
-    if let Err(e) = ensure_thread_loaded(&st, &key, &req.agent_id, &req.run_id).await {
+    if let Err(e) = ensure_thread_loaded(&st, &key, &req.agent_id, &req.run_id, &tenant).await {
         tracing::error!(thread_id = %key, "taint rehydrate failed, denying: {e}");
         return store_unavailable_deny(&st, &key, now, &req.tool);
     }
@@ -235,19 +322,12 @@ async fn mediate(
         return store_unavailable_deny(&st, &key, now, &req.tool);
     }
 
-    // 0. Killswitch (ASI08/10): an emergency-revoked tool — or a quarantined agent (e.g. one that
-    //    tripped a honeypot) — is refused outright, even mid-run, before any other check. Consulted
-    //    on every mediation so a revocation/quarantine takes effect immediately across all in-flight
-    //    sessions.
+    // 0. Killswitch (ASI08/10, Roadmap T1): the global stop, the tenant, a quarantined/revoked agent,
+    //    or a revoked tool refuses the call outright, before any other check. Consulted on every
+    //    mediation so a revocation takes effect immediately across all in-flight sessions.
     let revoked_reason: Option<&'static str> = {
         let ks = st.killswitch.lock().expect("killswitch poisoned");
-        if ks.is_revoked(&Target::Agent(req.agent_id.clone())) {
-            Some("agent quarantined (killswitch)")
-        } else if ks.is_revoked(&Target::Tool(req.tool.clone())) {
-            Some("tool revoked (killswitch)")
-        } else {
-            None
-        }
+        ks.blocks(tenant.as_str(), Some(&req.agent_id), Some(&req.tool))
     };
 
     // 1. Meter circuit breaker (Phase 1): a step + loop-detection check BEFORE the broker. A
@@ -359,9 +439,26 @@ async fn mediate(
     span.record("trifecta", cap.is_trifecta());
     crate::telemetry::record_decision(verdict, cap.is_trifecta());
 
+    // Typed span into the trace spine (Roadmap T0). Excessive agency (LLM06) is the risk the broker
+    // governs; the trifecta and step count travel as attributes.
+    let mut trace_span = Span::start(
+        Stage::BrokerCheck,
+        format!("broker.mediate {}", req.tool),
+        now,
+    )
+    .with_decision(policy_from(verdict, &reason))
+    .with_risk(Owasp::Llm06)
+    .attr("tool", &req.tool)
+    .attr("tenant", tenant.as_str())
+    .attr("trifecta", cap.is_trifecta())
+    .attr("steps", steps);
+    trace_span.end(now_ms());
+    emit_span(&st, &req.thread_id, &tenant, trace_span);
+
     Json(serde_json::json!({
         "decision": verdict,
         "reason": reason,
+        "tenant": tenant.as_str(),
         "capability": {
             "reads_untrusted": cap.reads_untrusted,
             "reads_sensitive": cap.reads_sensitive,
@@ -394,6 +491,7 @@ async fn ensure_thread_loaded(
     key: &str,
     agent_id: &str,
     run_id: &str,
+    tenant: &TenantId,
 ) -> StoreResult<()> {
     // Fast path: both already resident this process.
     {
@@ -425,7 +523,7 @@ async fn ensure_thread_loaded(
                 }
             }
             None => {
-                let mut s = Session::new(agent_id, run_id, key);
+                let mut s = Session::new(agent_id, run_id, key).with_tenant(tenant.clone());
                 if let Some(c) = stored_cap {
                     s.cap = c;
                 }
@@ -433,14 +531,15 @@ async fn ensure_thread_loaded(
             }
         }
     }
-    // Seed the meter from its snapshot, or fresh when the thread is new.
+    // Seed the meter from its snapshot, or fresh when the thread is new — with the tenant's budget.
     {
+        let limits = st.config.limits_for(tenant);
         let mut meters = st.meters.lock().expect("meter store poisoned");
         meters
             .entry(key.to_string())
             .or_insert_with(|| match stored_meter {
-                Some(snap) => Meter::from_snapshot(st.config.limits.clone(), snap),
-                None => Meter::new(st.config.limits.clone()),
+                Some(snap) => Meter::from_snapshot(limits, snap),
+                None => Meter::new(limits),
             });
     }
     Ok(())
@@ -836,6 +935,9 @@ struct IssueRequest {
     /// The action scope requested (defaults to the grant's `required_scope`).
     #[serde(default)]
     action_scope: Option<String>,
+    /// The tenant this request belongs to (Roadmap T1). Absent ⇒ the default tenant.
+    #[serde(default)]
+    tenant: Option<String>,
 }
 
 /// **The JIT credential-issue gate** (§11, ASI03/ASI06). Exchanges a validated identity credential
@@ -856,8 +958,14 @@ async fn credentials_issue(
     let now = now_ms();
     let key = req.thread_id.clone();
 
+    // Resolve the tenant (Roadmap T1). A malformed id fails closed.
+    let tenant = match tenant_of(&req.tenant) {
+        Ok(t) => t,
+        Err(reason) => return jit_deny_response(StatusCode::FORBIDDEN, reason),
+    };
+
     // Durable rehydrate + quarantine seed (fail closed exactly like /mediate).
-    if let Err(e) = ensure_thread_loaded(&st, &key, &req.agent_id, &req.run_id).await {
+    if let Err(e) = ensure_thread_loaded(&st, &key, &req.agent_id, &req.run_id, &tenant).await {
         tracing::error!(thread_id = %key, "taint rehydrate failed, denying jit issue: {e}");
         return jit_deny_response(StatusCode::SERVICE_UNAVAILABLE, "session state unavailable");
     }
@@ -866,22 +974,22 @@ async fn credentials_issue(
         return jit_deny_response(StatusCode::SERVICE_UNAVAILABLE, "session state unavailable");
     }
 
-    // Killswitch: a quarantined/revoked agent gets no credential, full stop.
-    if st
-        .killswitch
-        .lock()
-        .expect("killswitch poisoned")
-        .is_revoked(&Target::Agent(req.agent_id.clone()))
-    {
+    // Killswitch (Roadmap T1): the global stop, the tenant, or a quarantined/revoked agent gets no
+    // credential, full stop.
+    if let Some(reason) = st.killswitch.lock().expect("killswitch poisoned").blocks(
+        tenant.as_str(),
+        Some(&req.agent_id),
+        None,
+    ) {
         append_ledger(
             &st,
             &key,
             EntryKind::Decision,
-            format!("jit deny (agent quarantined) grant={}", req.grant_id),
+            format!("jit deny ({reason}) grant={}", req.grant_id),
             now,
         );
         crate::telemetry::record_decision("jit_deny", false);
-        return jit_deny_response(StatusCode::FORBIDDEN, "agent quarantined (killswitch)");
+        return jit_deny_response(StatusCode::FORBIDDEN, reason);
     }
 
     // The grant must exist (no grant → deny, the default-deny catalog).
@@ -910,6 +1018,20 @@ async fn credentials_issue(
         now,
         req.requested_ttl_secs,
     );
+
+    // Typed span into the trace spine (Roadmap T0). Identity/privilege abuse (ASI03) is the risk the
+    // JIT broker governs.
+    let mut trace_span = Span::start(
+        Stage::CredentialIssue,
+        format!("jit.issue {}", req.grant_id),
+        now,
+    )
+    .with_decision(PolicyDecision::from(decision.clone()))
+    .with_risk(Owasp::Asi03)
+    .attr("grant", &req.grant_id)
+    .attr("tenant", tenant.as_str());
+    trace_span.end(now_ms());
+    emit_span(&st, &req.thread_id, &tenant, trace_span);
 
     match decision {
         JitDecision::Deny(reason) => {
@@ -1031,6 +1153,90 @@ fn jit_deny_response(status: StatusCode, reason: &str) -> (StatusCode, Json<serd
     (
         status,
         Json(serde_json::json!({ "decision": "deny", "reason": reason })),
+    )
+}
+
+/// A request to scan a model response before it reaches the user (Roadmap T3 wiring: eval on live
+/// traffic). Carries the response text and the thread it belongs to.
+#[derive(Debug, Deserialize)]
+struct OutputScanRequest {
+    #[serde(default)]
+    thread_id: String,
+    #[serde(default)]
+    tenant: Option<String>,
+    response: String,
+}
+
+/// **Output scan** (§3 LLM02/LLM07): run the deterministic output evaluators — PHI/PII leak, plus a
+/// canary (system-prompt-leak) check built from the gate's honeypot canaries — over a model
+/// response, emit a typed `OutputScan` span, and block the response if it fails. This is how eval
+/// runs on live traffic; the LLM-judge evaluators run in a separate sampled job.
+#[tracing::instrument(name = "aegis.output_scan", skip_all, fields(thread_id = %req.thread_id))]
+async fn output_scan(
+    State(st): State<GateState>,
+    Json(req): Json<OutputScanRequest>,
+) -> impl IntoResponse {
+    let now = now_ms();
+    let tenant = match tenant_of(&req.tenant) {
+        Ok(t) => t,
+        Err(reason) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "decision": "deny", "reason": reason })),
+            )
+        }
+    };
+
+    // Deterministic output evaluators: PHI leak always; canary/system-prompt-leak when the gate has
+    // canaries configured.
+    let mut evaluators: Vec<Box<dyn aegis_eval::Evaluator>> =
+        vec![Box::new(aegis_eval::PhiLeakEvaluator)];
+    let canaries = st.config.honeypots.canaries.clone();
+    if !canaries.is_empty() {
+        evaluators.push(Box::new(aegis_eval::ForbiddenTermEvaluator::new(
+            canaries,
+            Some(Owasp::Llm07),
+        )));
+    }
+    let sample = aegis_eval::EvalSample {
+        tenant: tenant.clone(),
+        response: req.response.clone(),
+        ..Default::default()
+    };
+    let report = aegis_eval::ThresholdEngine::new().run(&evaluators, &sample);
+
+    let (verdict, policy) = if report.passed {
+        ("allow", PolicyDecision::Allow)
+    } else {
+        // A fixed, non-sensitive reason — never echo the response or the finding text.
+        (
+            "deny",
+            PolicyDecision::deny("output failed a safety evaluator"),
+        )
+    };
+
+    let mut span = Span::start(Stage::OutputScan, "output.scan", now)
+        .with_decision(policy)
+        .with_risk(Owasp::Llm02)
+        .attr("tenant", tenant.as_str())
+        .attr("min_score", report.min_score());
+    span.end(now_ms());
+    emit_span(&st, &req.thread_id, &tenant, span);
+    crate::telemetry::record_decision(verdict, false);
+
+    let status = if report.passed {
+        StatusCode::OK
+    } else {
+        StatusCode::UNPROCESSABLE_ENTITY
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "decision": verdict,
+            "tenant": tenant.as_str(),
+            "min_score": report.min_score(),
+            "scores": report.scores,
+        })),
     )
 }
 
@@ -2274,5 +2480,224 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["decision"], "deny");
         assert!(body["reason"].as_str().unwrap().contains("quarantined"));
+    }
+
+    // ── Typed span emission (Roadmap T0 wiring) ─────────────────────────────────────────────────
+
+    use aegis_trace::InMemoryCollector;
+
+    /// A router wired to an inspectable in-memory collector, plus a clone of the emitter so the test
+    /// can flush deterministically.
+    fn app_with_trace(collector: InMemoryCollector) -> (Router, SpanEmitter) {
+        let (emitter, handle) = SpanEmitter::spawn(collector, 256);
+        drop(handle); // detach the drain; emitter clones keep it alive for the test
+        let app = router_with_emitter(test_broker(), GateConfig::default(), emitter.clone());
+        (app, emitter)
+    }
+
+    #[tokio::test]
+    async fn mediate_emits_a_typed_broker_span() {
+        let collector = InMemoryCollector::new();
+        let (app, emitter) = app_with_trace(collector.clone());
+        let (_s, b) = post(
+            app,
+            "/mediate",
+            call(
+                "t-trace",
+                "web.fetch",
+                serde_json::json!({"url": "https://x"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(b["decision"], "allow");
+
+        emitter.flush(); // deterministic: the span is recorded before we read
+        let spans = collector.spans_for(&trace_id_for("t-trace"));
+        assert_eq!(spans.len(), 1, "one broker span per mediate call");
+        let sp = &spans[0];
+        assert_eq!(sp.stage, Stage::BrokerCheck);
+        assert!(sp.name.contains("web.fetch"));
+        assert!(sp.decision.as_ref().unwrap().is_allow());
+        assert!(sp.risks.contains(&Owasp::Llm06));
+        assert_eq!(
+            sp.attributes.get("tool").unwrap(),
+            &serde_json::json!("web.fetch")
+        );
+        assert_eq!(
+            sp.attributes.get("trifecta").unwrap(),
+            &serde_json::json!(false)
+        );
+        assert_eq!(
+            sp.attributes.get("tenant").unwrap(),
+            &serde_json::json!("default")
+        );
+    }
+
+    // ── Multi-tenancy (Roadmap T1) ──────────────────────────────────────────────────────────────
+
+    fn mediate_body(thread: &str, tenant: Option<&str>) -> serde_json::Value {
+        let mut b = serde_json::json!({
+            "agent_id": "a", "run_id": "r", "thread_id": thread,
+            "tool": "web.fetch", "args": {"url": "https://x"}, "arg_provenance": "user"
+        });
+        if let Some(t) = tenant {
+            b["tenant"] = serde_json::json!(t);
+        }
+        b
+    }
+
+    #[tokio::test]
+    async fn tenant_killswitch_blocks_only_that_tenant() {
+        let app = app();
+        let (_s, b) = post(
+            app.clone(),
+            "/killswitch/revoke",
+            serde_json::json!({ "kind": "tenant", "id": "acme" }),
+        )
+        .await;
+        assert_eq!(b["revoked_count"], 1);
+        let (_s, b) = post(
+            app.clone(),
+            "/mediate",
+            mediate_body("t-acme", Some("acme")),
+        )
+        .await;
+        assert_eq!(b["decision"], "deny");
+        assert_eq!(b["tenant"], "acme");
+        assert!(b["reason"].as_str().unwrap().contains("tenant revoked"));
+        let (_s, b) = post(
+            app.clone(),
+            "/mediate",
+            mediate_body("t-other", Some("other")),
+        )
+        .await;
+        assert_eq!(b["decision"], "allow");
+    }
+
+    #[tokio::test]
+    async fn global_killswitch_blocks_every_tenant() {
+        let app = app();
+        post(
+            app.clone(),
+            "/killswitch/revoke",
+            serde_json::json!({ "kind": "global" }),
+        )
+        .await;
+        let (_s, b) = post(app.clone(), "/mediate", mediate_body("t1", None)).await;
+        assert_eq!(b["decision"], "deny");
+        assert!(b["reason"].as_str().unwrap().contains("global killswitch"));
+    }
+
+    #[tokio::test]
+    async fn malformed_tenant_is_denied() {
+        let (_s, b) = post(app(), "/mediate", mediate_body("t1", Some("Bad Tenant"))).await;
+        assert_eq!(b["decision"], "deny");
+        assert_eq!(b["reason"], "invalid tenant id");
+    }
+
+    #[tokio::test]
+    async fn per_tenant_meter_budget_applies() {
+        // Tenant "tight" gets max_steps=1; the default tenant keeps the generous default.
+        let mut tl = HashMap::new();
+        tl.insert(
+            TenantId::new("tight").unwrap(),
+            Limits {
+                max_steps: 1,
+                ..Limits::default()
+            },
+        );
+        let app = router(
+            test_broker(),
+            GateConfig {
+                tenant_limits: tl,
+                ..Default::default()
+            },
+        );
+        let (_s, b) = post(
+            app.clone(),
+            "/mediate",
+            mediate_body("t-tight", Some("tight")),
+        )
+        .await;
+        assert_eq!(b["decision"], "allow");
+        let (_s, b) = post(
+            app.clone(),
+            "/mediate",
+            mediate_body("t-tight", Some("tight")),
+        )
+        .await;
+        assert_eq!(b["decision"], "deny");
+        assert!(b["reason"].as_str().unwrap().contains("circuit breaker"));
+        // A default-tenant thread is unaffected by the tight budget.
+        let (_s, b) = post(app.clone(), "/mediate", mediate_body("t-df", None)).await;
+        assert_eq!(b["decision"], "allow");
+        let (_s, b) = post(app.clone(), "/mediate", mediate_body("t-df", None)).await;
+        assert_eq!(b["decision"], "allow");
+    }
+
+    #[tokio::test]
+    async fn mediate_span_carries_the_deny_decision() {
+        let collector = InMemoryCollector::new();
+        let (app, emitter) = app_with_trace(collector.clone());
+        // An unknown tool is denied by the broker.
+        let (_s, b) = post(
+            app,
+            "/mediate",
+            call("t-deny", "nope", serde_json::json!({}), "user"),
+        )
+        .await;
+        assert_eq!(b["decision"], "deny");
+        emitter.flush();
+        let spans = collector.spans_for(&trace_id_for("t-deny"));
+        assert_eq!(spans.len(), 1);
+        let d = spans[0].decision.as_ref().unwrap();
+        assert!(d.is_deny());
+        assert!(d.reason().unwrap().contains("unknown tool"));
+    }
+
+    // ── Output scan (eval on live traffic, Roadmap T3 wiring) ───────────────────────────────────
+
+    #[tokio::test]
+    async fn output_scan_allows_clean_and_denies_phi() {
+        let app = app();
+        // A clean response passes.
+        let (status, b) = post(
+            app.clone(),
+            "/output/scan",
+            serde_json::json!({ "thread_id": "t", "response": "the dose is 5mg twice daily" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(b["decision"], "allow");
+        // PHI in the response is blocked before it reaches the user.
+        let (status, b) = post(
+            app.clone(),
+            "/output/scan",
+            serde_json::json!({ "thread_id": "t", "response": "patient SSN 123-45-6789" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(b["decision"], "deny");
+    }
+
+    #[tokio::test]
+    async fn output_scan_emits_a_typed_span() {
+        let collector = InMemoryCollector::new();
+        let (app, emitter) = app_with_trace(collector.clone());
+        post(
+            app,
+            "/output/scan",
+            serde_json::json!({ "thread_id": "t-out", "response": "clean", "tenant": "acme" }),
+        )
+        .await;
+        emitter.flush();
+        let spans = collector.spans_for(&trace_id_for("t-out"));
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].stage, Stage::OutputScan);
+        assert_eq!(
+            spans[0].attributes.get("tenant").unwrap(),
+            &serde_json::json!("acme")
+        );
     }
 }

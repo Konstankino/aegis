@@ -69,12 +69,15 @@ pub struct Session {
     pub run_id: String,
     /// This conversation/thread's id.
     pub thread_id: String,
+    /// The tenant this session belongs to (Roadmap T1). Defaults to [`TenantId::default`], so
+    /// single-tenant callers are unaffected.
+    pub tenant: aegis_core::TenantId,
     /// The monotonically accumulated Rule-of-Two capability taint for this session.
     pub cap: Capability,
 }
 
 impl Session {
-    /// Start a fresh session with no capability taint.
+    /// Start a fresh session with no capability taint, for the default tenant.
     pub fn new(
         agent_id: impl Into<String>,
         run_id: impl Into<String>,
@@ -84,8 +87,16 @@ impl Session {
             agent_id: agent_id.into(),
             run_id: run_id.into(),
             thread_id: thread_id.into(),
+            tenant: aegis_core::TenantId::default(),
             cap: Capability::NONE,
         }
+    }
+
+    /// Builder: bind this session to a tenant (Roadmap T1).
+    #[must_use]
+    pub fn with_tenant(mut self, tenant: aegis_core::TenantId) -> Self {
+        self.tenant = tenant;
+        self
     }
 }
 
@@ -168,6 +179,7 @@ pub fn mediate(session: &mut Session, call: &ToolCall, broker: &Broker) -> Decis
     // 3. Deterministic authorization in code (Cedar), never via the model.
     let principal = PolicyPrincipal {
         agent_id: &session.agent_id,
+        tenant: session.tenant.as_str(),
         cap: session.cap,
     };
     match broker.engine.is_authorized(
@@ -192,6 +204,35 @@ pub fn mediate(session: &mut Session, call: &ToolCall, broker: &Broker) -> Decis
     match spec.consequence {
         Consequence::LowReversible => Decision::Allow,
         Consequence::HighOrIrreversible => Decision::HumanApprove,
+    }
+}
+
+/// Map into the plane-wide [`PolicyDecision`](aegis_core::PolicyDecision) vocabulary (Roadmap T0).
+/// `HumanApprove` is an escalation; `Deny` carries its reason through unchanged.
+impl From<Decision> for aegis_core::PolicyDecision {
+    fn from(d: Decision) -> Self {
+        match d {
+            Decision::Allow => aegis_core::PolicyDecision::Allow,
+            Decision::HumanApprove => {
+                aegis_core::PolicyDecision::escalate("requires human approval")
+            }
+            Decision::Deny(reason) => aegis_core::PolicyDecision::Deny(reason),
+        }
+    }
+}
+
+#[cfg(test)]
+mod policy_decision_adapter_tests {
+    use super::*;
+    #[test]
+    fn maps_into_policy_decision() {
+        use aegis_core::PolicyDecision;
+        assert!(PolicyDecision::from(Decision::Allow).is_allow());
+        assert!(PolicyDecision::from(Decision::HumanApprove).is_escalate());
+        assert_eq!(
+            PolicyDecision::from(Decision::deny("nope")).reason(),
+            Some("nope")
+        );
     }
 }
 

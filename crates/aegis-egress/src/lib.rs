@@ -183,6 +183,30 @@ pub mod app {
     }
 }
 
+/// Map into the plane-wide [`PolicyDecision`](aegis_core::PolicyDecision) vocabulary (Roadmap T0).
+impl From<EgressDecision> for aegis_core::PolicyDecision {
+    fn from(d: EgressDecision) -> Self {
+        match d {
+            EgressDecision::Allow(_) => aegis_core::PolicyDecision::Allow,
+            EgressDecision::Deny(reason) => aegis_core::PolicyDecision::deny(reason),
+        }
+    }
+}
+
+#[cfg(test)]
+mod policy_decision_adapter_tests {
+    use super::*;
+    #[test]
+    fn maps_into_policy_decision() {
+        use aegis_core::PolicyDecision;
+        assert!(PolicyDecision::from(EgressDecision::Allow("https://x".into())).is_allow());
+        assert_eq!(
+            PolicyDecision::from(EgressDecision::Deny("blocked host")).reason(),
+            Some("blocked host")
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -29,9 +29,22 @@ pub enum WriteOutcome {
 
 impl PolicyDir {
     /// Construct a policy dir rooted at `root`. The path is used verbatim as the boundary; only the
-    /// seven [`Artifact`] basenames are ever joined to it.
+    /// known [`Artifact`] basenames are ever joined to it.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
+    }
+
+    /// A **tenant-scoped** policy dir: artifacts live under `<root>/tenants/<tenant>/` (Roadmap T1),
+    /// so each tenant has its own `tools.json`/`broker.cedar`/`grants.toml`/… The tenant is validated
+    /// as a slug and rejected if it is `.`/`..`, so it is a safe single path segment (no traversal).
+    pub fn for_tenant(root: impl Into<PathBuf>, tenant: &str) -> Result<Self> {
+        aegis_core::TenantId::new(tenant).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if tenant == "." || tenant == ".." {
+            bail!("invalid tenant path segment '{tenant}'");
+        }
+        Ok(Self {
+            root: root.into().join("tenants").join(tenant),
+        })
     }
 
     /// The directory root.
@@ -245,6 +258,21 @@ mod tests {
             assert_eq!(p.parent().unwrap(), Path::new("/policies"));
             assert_eq!(p.file_name().unwrap().to_str().unwrap(), a.filename());
         }
+    }
+
+    #[test]
+    fn for_tenant_nests_under_tenants_and_rejects_bad_slugs() {
+        let d = PolicyDir::for_tenant("/policies", "acme").unwrap();
+        assert!(d.root().ends_with("tenants/acme"));
+        // Every artifact still resolves inside the tenant dir (no traversal).
+        for a in Artifact::ALL {
+            assert!(d.resolve(a).starts_with(d.root()));
+        }
+        // Dot segments and non-slug ids are refused.
+        assert!(PolicyDir::for_tenant("/policies", "..").is_err());
+        assert!(PolicyDir::for_tenant("/policies", ".").is_err());
+        assert!(PolicyDir::for_tenant("/policies", "Bad Slug").is_err());
+        assert!(PolicyDir::for_tenant("/policies", "").is_err());
     }
 
     #[test]

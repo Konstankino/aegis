@@ -123,6 +123,27 @@ impl SandboxPolicy {
     }
 }
 
+/// Map into the plane-wide [`PolicyDecision`](aegis_core::PolicyDecision) vocabulary (Roadmap T0).
+impl From<ExecDecision> for aegis_core::PolicyDecision {
+    fn from(d: ExecDecision) -> Self {
+        match d {
+            ExecDecision::Allow => aegis_core::PolicyDecision::Allow,
+            ExecDecision::Deny(reason) => aegis_core::PolicyDecision::deny(reason),
+        }
+    }
+}
+
+#[cfg(test)]
+mod policy_decision_adapter_tests {
+    use super::*;
+    #[test]
+    fn maps_into_policy_decision() {
+        use aegis_core::PolicyDecision;
+        assert!(PolicyDecision::from(ExecDecision::Allow).is_allow());
+        assert!(PolicyDecision::from(ExecDecision::Deny("root")).is_deny());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

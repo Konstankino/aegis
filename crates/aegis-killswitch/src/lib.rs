@@ -24,6 +24,10 @@ pub enum Target {
     Prompt(String),
     /// An inter-agent connection, by id.
     Connection(String),
+    /// A whole tenant, by id — cuts off every request for that tenant (Roadmap T1).
+    Tenant(String),
+    /// Everything, everywhere — the global stop (Roadmap T1).
+    Global,
 }
 
 /// The outcome of a reintegration attempt.
@@ -73,6 +77,43 @@ impl Killswitch {
             Target::Agent(id) => self.quarantined.contains(id),
             _ => false,
         }
+    }
+
+    /// Lift a revocation (e.g. re-enable a tenant or clear the global stop). Returns whether one was
+    /// removed. Agents are restored via [`reintegrate`](Killswitch::reintegrate), which also clears
+    /// any quarantine.
+    pub fn restore(&mut self, target: &Target) -> bool {
+        self.revoked.remove(target)
+    }
+
+    /// The composed block check for a request (Roadmap T1): global stop, then the tenant, then the
+    /// agent (revoked or quarantined), then the tool. Returns a fixed, non-sensitive reason for the
+    /// first that blocks, or `None`. `tenant` is a slug; `agent`/`tool` are optional so the same
+    /// check serves `/mediate` (both) and `/credentials/issue` (agent only).
+    #[must_use]
+    pub fn blocks(
+        &self,
+        tenant: &str,
+        agent: Option<&str>,
+        tool: Option<&str>,
+    ) -> Option<&'static str> {
+        if self.is_revoked(&Target::Global) {
+            return Some("global killswitch engaged");
+        }
+        if self.is_revoked(&Target::Tenant(tenant.to_string())) {
+            return Some("tenant revoked (killswitch)");
+        }
+        if let Some(a) = agent {
+            if self.is_revoked(&Target::Agent(a.to_string())) {
+                return Some("agent quarantined (killswitch)");
+            }
+        }
+        if let Some(t) = tool {
+            if self.is_revoked(&Target::Tool(t.to_string())) {
+                return Some("tool revoked (killswitch)");
+            }
+        }
+        None
     }
 
     /// Quarantine a suspicious agent: it is treated as revoked until reintegrated.
@@ -181,6 +222,57 @@ mod tests {
         // An empty object still loads (both fields default).
         let empty: Killswitch = serde_json::from_str("{}").unwrap();
         assert_eq!(empty.revoked_count(), 0);
+    }
+
+    #[test]
+    fn tenant_and_global_scope_block_and_restore() {
+        let mut ks = Killswitch::new();
+        // Nothing blocks by default.
+        assert_eq!(ks.blocks("acme", Some("a1"), Some("db.write")), None);
+        // Revoke one tenant: its requests block, another tenant's don't.
+        ks.revoke(Target::Tenant("acme".into()));
+        assert_eq!(
+            ks.blocks("acme", Some("a1"), None),
+            Some("tenant revoked (killswitch)")
+        );
+        assert_eq!(ks.blocks("other", Some("a1"), None), None);
+        // Restore lifts it.
+        assert!(ks.restore(&Target::Tenant("acme".into())));
+        assert_eq!(ks.blocks("acme", Some("a1"), None), None);
+        // Global stop blocks everyone.
+        ks.revoke(Target::Global);
+        assert_eq!(
+            ks.blocks("any", None, None),
+            Some("global killswitch engaged")
+        );
+    }
+
+    #[test]
+    fn tenant_and_global_targets_serde() {
+        for t in [Target::Tenant("acme".into()), Target::Global] {
+            let j = serde_json::to_string(&t).unwrap();
+            assert_eq!(serde_json::from_str::<Target>(&j).unwrap(), t);
+        }
+        assert_eq!(
+            serde_json::to_string(&Target::Global).unwrap(),
+            "{\"kind\":\"global\"}"
+        );
+    }
+
+    #[test]
+    fn blocks_reports_agent_then_tool() {
+        let mut ks = Killswitch::new();
+        ks.quarantine("a1");
+        assert_eq!(
+            ks.blocks("t", Some("a1"), Some("db.write")),
+            Some("agent quarantined (killswitch)")
+        );
+        let mut ks = Killswitch::new();
+        ks.revoke(Target::Tool("db.write".into()));
+        assert_eq!(
+            ks.blocks("t", Some("a1"), Some("db.write")),
+            Some("tool revoked (killswitch)")
+        );
     }
 
     #[test]

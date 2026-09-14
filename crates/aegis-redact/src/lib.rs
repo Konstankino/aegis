@@ -35,6 +35,10 @@ pub enum FindingKind {
     Iban,
     /// A Ukrainian individual taxpayer number (ІПН / РНОКПП) — 10 digits, checksum-validated.
     UaTaxId,
+    /// A medical record number — a labelled `MRN …` identifier (PHI, Roadmap T2).
+    Mrn,
+    /// A date of birth — a labelled `DOB …` date (PHI, Roadmap T2).
+    Dob,
 }
 
 impl FindingKind {
@@ -51,6 +55,8 @@ impl FindingKind {
             FindingKind::PrivateKey => "[REDACTED:PRIVATE_KEY]",
             FindingKind::Iban => "[REDACTED:IBAN]",
             FindingKind::UaTaxId => "[REDACTED:UA_TAX_ID]",
+            FindingKind::Mrn => "[REDACTED:MRN]",
+            FindingKind::Dob => "[REDACTED:DOB]",
         }
     }
 }
@@ -127,6 +133,22 @@ fn detectors() -> &'static [Detector] {
             Detector {
                 kind: FindingKind::Email,
                 re: Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}").unwrap(),
+                validate: None,
+            },
+            // Labelled PHI (Roadmap T2) — run BEFORE the bare-digit detectors so a labelled MRN/DOB
+            // is redacted whole under its own kind rather than caught as a phone/tax-id/card digit run.
+            // A medical record number: `MRN` (any case) + 6–10 digits.
+            Detector {
+                kind: FindingKind::Mrn,
+                re: Regex::new(r"(?i)\bMRN[:#\s]{0,3}\d{6,10}\b").unwrap(),
+                validate: None,
+            },
+            // A date of birth: `DOB`/`D.O.B` + a date. The label gates it, so ordinary dates in text
+            // are left alone (only a date asserted to be a birth date is PHI here).
+            Detector {
+                kind: FindingKind::Dob,
+                re: Regex::new(r"(?i)\b(?:DOB|D\.O\.B\.?)[:\s]{0,3}\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
+                    .unwrap(),
                 validate: None,
             },
             // IBAN: 2 letters + 2 check digits + up to 30 alnum, gated by the ISO-13616 mod-97
@@ -416,6 +438,22 @@ mod tests {
         let r2 = redact("pay to GB00WEST12345698765432 today");
         assert_eq!(r2.findings.get(&FindingKind::Iban), None);
         assert!(r2.text.contains("GB00WEST12345698765432"));
+    }
+
+    #[test]
+    fn redacts_labelled_mrn_and_dob_but_not_plain_dates() {
+        let r = redact("Patient MRN: 00123456 seen today");
+        assert_eq!(r.findings.get(&FindingKind::Mrn), Some(&1));
+        assert!(r.text.contains("[REDACTED:MRN]") && !r.text.contains("00123456"));
+
+        let r = redact("DOB 01/02/1990 on file; D.O.B: 3-4-88 elsewhere");
+        assert_eq!(r.findings.get(&FindingKind::Dob), Some(&2));
+        assert!(!r.text.contains("1990"));
+
+        // An unlabelled date (not asserted as a birth date) is not treated as DOB PHI.
+        let r = redact("the appointment is on 01/02/1990");
+        assert_eq!(r.findings.get(&FindingKind::Dob), None);
+        assert!(r.text.contains("01/02/1990"));
     }
 
     #[test]

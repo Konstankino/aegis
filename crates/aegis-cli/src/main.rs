@@ -26,6 +26,10 @@ struct Cli {
     /// Policy directory (default: $AEGIS_POLICY_DIR or ./policies).
     #[arg(long, global = true)]
     dir: Option<PathBuf>,
+    /// Operate on a tenant's policies under <dir>/tenants/<tenant>/ (Roadmap T1). Omit for the
+    /// single shared policy dir.
+    #[arg(long, global = true)]
+    tenant: Option<String>,
     /// Output format for `show`/`list`: text | json | toml.
     #[arg(long, global = true, default_value = "text")]
     format: String,
@@ -428,11 +432,14 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
-    let dir = PolicyDir::new(
-        cli.dir
-            .or_else(|| std::env::var_os("AEGIS_POLICY_DIR").map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("policies")),
-    );
+    let base = cli
+        .dir
+        .or_else(|| std::env::var_os("AEGIS_POLICY_DIR").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("policies"));
+    let dir = match &cli.tenant {
+        Some(t) => PolicyDir::for_tenant(base, t)?,
+        None => PolicyDir::new(base),
+    };
     let format = Format::parse(&cli.format)?;
     let dry = cli.dry_run;
     let color = !cli.no_color;
