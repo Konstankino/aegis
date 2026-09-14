@@ -91,3 +91,19 @@ output "jit_external_id" {
   description = "The sts:ExternalId condition value required to assume any JIT per-grant role."
   value       = "${var.project_name}-jit"
 }
+
+# ── Optional modules (separate templates) ─────────────────────────────────────────────────────────
+output "rag_db_endpoint" {
+  description = "RAG vector-DB endpoint (host:port), when enable_rag = true; null otherwise."
+  value       = one(module.rag[*].db_endpoint)
+}
+
+output "rag_credentials_secret_arn" {
+  description = "Secrets Manager ARN for the RAG DB credentials, when enable_rag = true."
+  value       = one(module.rag[*].credentials_secret_arn)
+}
+
+output "phoenix_endpoint" {
+  description = "Arize Phoenix URL (UI + OTLP-over-HTTP), when enable_phoenix = true; null otherwise."
+  value       = one(module.phoenix[*].endpoint)
+}

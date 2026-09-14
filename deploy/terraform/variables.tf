@@ -86,6 +86,33 @@ variable "jit_grants" {
   }
 }
 
+variable "enable_rag" {
+  description = <<-EOT
+    Deploy the SEPARATE RAG engine module (modules/rag): a pgvector PostgreSQL vector store in the
+    private subnets that the Aegis RetrievalBackend adapter connects to. Off by default; requires
+    enable_vpc = true. Omit it for a pure tool-calling agent, or to point the adapter at an existing
+    vector store instead.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "enable_phoenix" {
+  description = <<-EOT
+    Deploy the SEPARATE Arize Phoenix dashboard module (modules/phoenix): the trace/eval dashboard at
+    the observability layer. Off by default; requires enable_vpc = true. Omit it to use Langfuse /
+    Grafana instead against the same OTLP export.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "phoenix_ui_cidrs" {
+  description = "CIDRs allowed to reach the internal Phoenix UI (e.g. a VPN/bastion range). Used only when enable_phoenix = true."
+  type        = list(string)
+  default     = []
+}
+
 variable "log_retention_days" {
   description = "CloudWatch Logs retention for the agent function."
   type        = number

@@ -39,3 +39,13 @@ log_retention_days = 14
 #   }
 # }
 jit_grants = {}
+
+# ── Separate, optional modules (properly layered — see docs/infrastructure-layers.md) ──────────────
+# The RAG *engine* Aegis governs — a pgvector vector store (modules/rag). Off by default; needs a VPC.
+# Omit it for a pure tool-calling agent, or to point the RetrievalBackend adapter at an existing store.
+enable_rag = false
+
+# The observability dashboard — Arize Phoenix (modules/phoenix). Off by default; needs a VPC. Swap for
+# Langfuse/Grafana by leaving this off and deploying that stack against the same OTLP export.
+enable_phoenix   = false
+phoenix_ui_cidrs = [] # e.g. ["10.0.0.0/8"] — the VPN/bastion range allowed to reach the internal UI

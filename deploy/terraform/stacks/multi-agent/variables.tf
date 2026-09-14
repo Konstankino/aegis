@@ -39,3 +39,21 @@ variable "projects" {
     model_id     = optional(string)
   }))
 }
+
+variable "enable_rag" {
+  description = "Deploy the separate RAG engine module (modules/rag). Requires enable_vpc = true."
+  type        = bool
+  default     = false
+}
+
+variable "enable_phoenix" {
+  description = "Deploy the separate Arize Phoenix dashboard module (modules/phoenix). Requires enable_vpc = true."
+  type        = bool
+  default     = false
+}
+
+variable "phoenix_ui_cidrs" {
+  description = "CIDRs allowed to reach the internal Phoenix UI (used only when enable_phoenix = true)."
+  type        = list(string)
+  default     = []
+}
