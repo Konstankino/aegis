@@ -21,6 +21,32 @@ pub fn persist(bucket: Option<String>, key: String, body: String) {
     let _ = (bucket, key, body);
 }
 
+/// Blocking persist: write one ledger entry and AWAIT the result, so high-signal evidence (a
+/// honeypot tripwire) is durable BEFORE the gate responds — a fire-and-forget spawn could be lost if
+/// the environment is frozen/torn down right after the response. Returns `true` when the entry is
+/// durably stored, or when there is intentionally no sink (no bucket / no `s3` feature — the boot
+/// path warns about that once); `false` only on an actual write failure.
+pub async fn persist_blocking(bucket: Option<String>, key: String, body: String) -> bool {
+    #[cfg(feature = "s3")]
+    {
+        if let Some(bucket) = bucket {
+            return match put_object(&bucket, &key, body).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("durable ledger persist to s3://{bucket}/{key} failed: {e}");
+                    false
+                }
+            };
+        }
+        true // no bucket configured: no durable sink to attempt (see the boot-time warning)
+    }
+    #[cfg(not(feature = "s3"))]
+    {
+        let _ = (bucket, key, body);
+        true
+    }
+}
+
 #[cfg(feature = "s3")]
 async fn put_object(bucket: &str, key: &str, body: String) -> Result<(), String> {
     use tokio::sync::OnceCell;

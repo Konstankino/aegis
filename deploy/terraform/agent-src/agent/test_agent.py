@@ -129,17 +129,18 @@ class EngineTest(unittest.TestCase):
             return {"decision": "allow"} if allow else {"decision": "deny", "reason": "policy denies this"}
 
         self._orig = (agent.bedrock, agent.mediate, agent._wait_for_gate, agent.preflight,
-                      agent.save_messages, agent.load_messages)
+                      agent.save_messages, agent.load_messages, agent.scan_output)
         agent.bedrock = self.model
         agent.mediate = fake_mediate
         agent._wait_for_gate = lambda *a, **k: True
         agent.preflight = lambda *a, **k: {"decision": "allow"}
         agent.save_messages = lambda *a, **k: None
         agent.load_messages = lambda *a, **k: None
+        agent.scan_output = lambda *a, **k: True  # output scan allows unless a test overrides
 
     def tearDown(self):
         (agent.bedrock, agent.mediate, agent._wait_for_gate, agent.preflight,
-         agent.save_messages, agent.load_messages) = self._orig
+         agent.save_messages, agent.load_messages, agent.scan_output) = self._orig
 
     # ── Converse specs are built from tools.json, not hard-coded ────────────────────────────────
     def test_specs_are_derived_from_tools_json(self):
@@ -195,6 +196,26 @@ class EngineTest(unittest.TestCase):
                              {"t_echo", "t_hand", "t_collect"})
             self.assertEqual(prof["terminal"], {})  # no terminal -> returns an answer
         agent.reload_bundle(self._tmp.name)
+
+    # ── output scanning (LLM02): a failing scan blocks the outgoing text, fail-closed ────────────
+    def test_output_scan_blocks_a_failing_final_answer(self):
+        # A single-tool bundle whose model just answers (no tool call), with the scan denying.
+        with tempfile.TemporaryDirectory() as d:
+            _write_bundle(d, manifest=None, plugin=None)
+            agent.reload_bundle(d)
+            agent.bedrock = type("M", (), {"converse": staticmethod(
+                lambda **_k: _msg([{"text": "patient SSN 123-45-6789"}]))})()
+            agent.scan_output = lambda *_a, **_k: False  # scan denies
+            out = agent.handler({"agent_id": "x", "thread_id": "t", "input": "hi"}, None)
+            self.assertEqual(out["answer"], agent.SAFE_BLOCK)
+            self.assertNotIn("123-45-6789", out["answer"])
+        agent.reload_bundle(self._tmp.name)
+
+    def test_output_scan_blocks_a_failing_handoff(self):
+        # A terminal handoff whose payload fails the scan is replaced before it moves downstream.
+        agent.scan_output = lambda *_a, **_k: False
+        out = agent.handler({"agent_id": "p-a", "thread_id": "t", "input": "hi"}, None)
+        self.assertEqual(out["output"], agent.SAFE_BLOCK)
 
 
 if __name__ == "__main__":

@@ -87,6 +87,13 @@ pub struct GateConfig {
     /// in-memory-only behaviour). Set from `AEGIS_CHECKPOINT_TABLE` in production (feature
     /// `dynamodb`).
     pub store: Option<Arc<SessionStore>>,
+    /// Whether to TRUST the caller-supplied `arg_provenance` on `/mediate`. **Off by default**: the
+    /// loopback caller is the (possibly prompt-injected) agent, and a caller claiming `user`/`trusted`
+    /// would suppress the Rule-of-Two untrusted-input leg (leg A) and dodge trifecta escalation. With
+    /// this off, every tool-call argument is treated as `Untrusted` regardless of the claim — the
+    /// safe default for an agentic loop (the reference agent already only ever sends `untrusted`).
+    /// Enable only where an out-of-band, trustworthy provenance signal genuinely exists.
+    pub trust_arg_provenance: bool,
 }
 
 impl GateConfig {
@@ -117,6 +124,9 @@ struct GateState {
     // Agents whose durable quarantine this process has already consulted, so the store is read at
     // most once per agent per cold environment rather than on every mediation.
     quarantine_checked: Arc<Mutex<HashSet<String>>>,
+    // Threads whose durable audit-ledger head this process has already rehydrated, so the store is
+    // read at most once per thread per cold environment (mirrors `quarantine_checked`).
+    ledger_loaded: Arc<Mutex<HashSet<String>>>,
     // Non-blocking typed-span emitter (Roadmap T0): each gate decision is recorded as a `Span` into
     // a `Trace` keyed by the thread id, forwarded to the trace collector on a background thread.
     emitter: SpanEmitter,
@@ -154,6 +164,7 @@ pub fn router_with_emitter(
         killswitch: Arc::new(Mutex::new(Killswitch::new())),
         store,
         quarantine_checked: Arc::new(Mutex::new(HashSet::new())),
+        ledger_loaded: Arc::new(Mutex::new(HashSet::new())),
         emitter,
     };
     Router::new()
@@ -261,7 +272,13 @@ async fn mediate(
     Json(req): Json<MediateRequest>,
 ) -> impl IntoResponse {
     let now = now_ms();
-    let prov = req.arg_provenance.unwrap_or(Provenance::Untrusted);
+    // Do NOT let a caller downgrade the taint: unless provenance-trust is explicitly enabled, every
+    // tool-call argument is Untrusted regardless of what the caller claims (see `trust_arg_provenance`).
+    let prov = if st.config.trust_arg_provenance {
+        req.arg_provenance.unwrap_or(Provenance::Untrusted)
+    } else {
+        Provenance::Untrusted
+    };
     let key = req.thread_id.clone();
     let loop_hash = state_hash(&req.tool, &req.args);
 
@@ -279,13 +296,14 @@ async fn mediate(
     // call — the same detect→evidence→escalate loop as a sandbox decoy hit. The token value is
     // never logged (it is a secret); only the tool name is recorded.
     if st.config.honeypots.scan(&req.args.to_string()).is_some() {
-        let (ledger_seq, ledger_hash) = append_ledger(
+        let (ledger_seq, ledger_hash, _durable) = append_ledger_durable(
             &st,
             &key,
             EntryKind::Tripwire,
             format!("honeypot canary in tool args: tool={}", req.tool),
             now,
-        );
+        )
+        .await;
         st.killswitch
             .lock()
             .expect("killswitch poisoned")
@@ -315,11 +333,11 @@ async fn mediate(
     // store that cannot be read denies rather than proceed with reset taint.
     if let Err(e) = ensure_thread_loaded(&st, &key, &req.agent_id, &req.run_id, &tenant).await {
         tracing::error!(thread_id = %key, "taint rehydrate failed, denying: {e}");
-        return store_unavailable_deny(&st, &key, now, &req.tool);
+        return store_unavailable_deny(&st, &key, now, &req.tool).await;
     }
     if let Err(e) = ensure_quarantine_loaded(&st, &req.agent_id).await {
         tracing::error!(agent = %req.agent_id, "quarantine rehydrate failed, denying: {e}");
-        return store_unavailable_deny(&st, &key, now, &req.tool);
+        return store_unavailable_deny(&st, &key, now, &req.tool).await;
     }
 
     // 0. Killswitch (ASI08/10, Roadmap T1): the global stop, the tenant, a quarantined/revoked agent,
@@ -394,7 +412,7 @@ async fn mediate(
     if verdict == "human_approve" {
         if let Some(e) = cap_result.err().or(meter_result.err()) {
             tracing::error!(thread_id = %key, "session-state persist failed before HITL pause: {e}");
-            return store_unavailable_deny(&st, &key, now, &req.tool);
+            return store_unavailable_deny(&st, &key, now, &req.tool).await;
         }
     } else {
         if let Err(e) = cap_result {
@@ -405,25 +423,16 @@ async fn mediate(
         }
     }
 
-    // 3. Audit ledger (Phase 1): append a tamper-evident entry for this decision.
-    let (ledger_seq, ledger_hash) = {
-        let mut ledgers = st.ledgers.lock().expect("ledger store poisoned");
-        let ledger = ledgers.entry(key.clone()).or_default();
-        let entry = ledger.append(
-            EntryKind::Decision,
-            key.as_str(),
-            key.as_str(),
-            format!("{verdict} tool={}", req.tool),
-            now,
-        );
-        // Fold-in: persist the entry to the immutable (Object Lock) sink, best-effort.
-        crate::ledger_sink::persist(
-            st.config.ledger_bucket.clone(),
-            format!("{key}/{:020}-{}.json", entry.seq, entry.hash),
-            serde_json::to_string(entry).unwrap_or_default(),
-        );
-        (entry.seq, entry.hash.clone())
-    };
+    // 3. Audit ledger (Phase 1): append a tamper-evident entry for this decision (resumes the chain
+    //    from the durable head on a cold start, and writes the new head back).
+    let (ledger_seq, ledger_hash) = append_ledger(
+        &st,
+        &key,
+        EntryKind::Decision,
+        format!("{verdict} tool={}", req.tool),
+        now,
+    )
+    .await;
 
     // Meter snapshot for the response + telemetry.
     let (tripped, steps, total_cost) = {
@@ -611,7 +620,7 @@ async fn persist_meter(st: &GateState, key: &str) {
 /// The fail-closed response for a store outage: record a `deny` in the audit ledger and refuse.
 /// Used when the durable taint/meter/quarantine store cannot be consulted — the gate must never
 /// proceed with possibly-reset taint.
-fn store_unavailable_deny(
+async fn store_unavailable_deny(
     st: &GateState,
     key: &str,
     now: u64,
@@ -623,7 +632,8 @@ fn store_unavailable_deny(
         EntryKind::Decision,
         format!("deny (session state unavailable) tool={tool}"),
         now,
-    );
+    )
+    .await;
     crate::telemetry::record_decision("deny", false);
     Json(serde_json::json!({
         "decision": "deny",
@@ -981,19 +991,21 @@ async fn credentials_issue(
     }
 
     // Killswitch (Roadmap T1): the global stop, the tenant, or a quarantined/revoked agent gets no
-    // credential, full stop.
-    if let Some(reason) = st.killswitch.lock().expect("killswitch poisoned").blocks(
-        tenant.as_str(),
-        Some(&req.agent_id),
-        None,
-    ) {
+    // credential, full stop. Resolve the decision in its own scope so the killswitch lock is dropped
+    // BEFORE the `.await` below (a guard held across an await makes the handler future `!Send`).
+    let revoked_reason: Option<&'static str> = {
+        let ks = st.killswitch.lock().expect("killswitch poisoned");
+        ks.blocks(tenant.as_str(), Some(&req.agent_id), None)
+    };
+    if let Some(reason) = revoked_reason {
         append_ledger(
             &st,
             &key,
             EntryKind::Decision,
             format!("jit deny ({reason}) grant={}", req.grant_id),
             now,
-        );
+        )
+        .await;
         crate::telemetry::record_decision("jit_deny", false);
         return jit_deny_response(StatusCode::FORBIDDEN, reason);
     }
@@ -1053,7 +1065,8 @@ async fn credentials_issue(
                 EntryKind::Decision,
                 format!("jit deny ({reason}) grant={}", req.grant_id),
                 now,
-            );
+            )
+            .await;
             tracing::Span::current().record("decision", "deny");
             crate::telemetry::record_decision("jit_deny", false);
             jit_deny_response(StatusCode::FORBIDDEN, reason)
@@ -1066,7 +1079,8 @@ async fn credentials_issue(
                 EntryKind::Decision,
                 format!("jit human_approve ({reason}) grant={}", req.grant_id),
                 now,
-            );
+            )
+            .await;
             tracing::Span::current().record("decision", "human_approve");
             crate::telemetry::record_decision("jit_human_approve", false);
             (
@@ -1120,7 +1134,8 @@ async fn credentials_issue(
                             req.grant_id, grant.audience, minted.kind, ttl_secs, minted.expires_at_ms, consequence
                         ),
                         now,
-                    );
+                    )
+                    .await;
                     tracing::Span::current().record("decision", "grant");
                     crate::telemetry::record_decision("jit_issue", true);
                     (
@@ -1149,7 +1164,8 @@ async fn credentials_issue(
                         EntryKind::Decision,
                         format!("jit mint failed grant={}", req.grant_id),
                         now,
-                    );
+                    )
+                    .await;
                     tracing::error!(grant = %req.grant_id, "jit mint failed: {e}");
                     crate::telemetry::record_decision("jit_deny", false);
                     jit_deny_response(StatusCode::BAD_GATEWAY, "credential mint failed")
@@ -1252,22 +1268,118 @@ async fn output_scan(
     )
 }
 
-fn append_ledger(
+/// Rehydrate this thread's audit-ledger head from the durable store on the first append in a cold
+/// environment, so the hash chain RESUMES from the last persisted entry instead of forking a fresh
+/// genesis chain. Read at most once per thread per process (guarded by `ledger_loaded`). Best-effort:
+/// a head-read error is surfaced to the caller, which records the entry anyway (an audit event must
+/// not be dropped because continuity could not be restored) but from a fresh segment.
+async fn ensure_ledger_loaded(st: &GateState, key: &str) -> StoreResult<()> {
+    if st
+        .ledger_loaded
+        .lock()
+        .expect("ledger_loaded poisoned")
+        .contains(key)
+    {
+        return Ok(());
+    }
+    // If this process already has an in-memory ledger for the thread, it is the authority.
+    if st
+        .ledgers
+        .lock()
+        .expect("ledger store poisoned")
+        .contains_key(key)
+    {
+        st.ledger_loaded
+            .lock()
+            .expect("ledger_loaded poisoned")
+            .insert(key.to_string());
+        return Ok(());
+    }
+    let head = st.store.load_ledger_head(key).await?;
+    {
+        let mut ledgers = st.ledgers.lock().expect("ledger store poisoned");
+        // Seed a resumed ledger only if nothing raced us to create one.
+        if !ledgers.contains_key(key) {
+            if let Some((last_seq, last_hash)) = head {
+                // The next entry continues from the persisted head.
+                ledgers.insert(key.to_string(), Ledger::resume(last_seq + 1, last_hash));
+            }
+            // No prior head ⇒ leave absent; the append below creates a genesis ledger.
+        }
+    }
+    st.ledger_loaded
+        .lock()
+        .expect("ledger_loaded poisoned")
+        .insert(key.to_string());
+    Ok(())
+}
+
+/// Append one entry to a thread's audit ledger, RESUMING the chain from the durable head on a cold
+/// start and WRITING THE NEW HEAD BACK so the next cold start continues it. `durable` awaits the
+/// immutable entry write (tripwire evidence); otherwise it is fire-and-forget. Returns `(seq, hash)`.
+async fn record_ledger(
+    st: &GateState,
+    key: &str,
+    kind: EntryKind,
+    summary: String,
+    now: u64,
+    durable: bool,
+) -> (u64, String) {
+    if let Err(e) = ensure_ledger_loaded(st, key).await {
+        tracing::warn!(%key, "ledger head rehydrate failed; recording from a fresh segment: {e}");
+    }
+    // Build the entry under the lock (sync), then release it BEFORE any await.
+    let (seq, hash, body) = {
+        let mut ledgers = st.ledgers.lock().expect("ledger store poisoned");
+        let ledger = ledgers.entry(key.to_string()).or_default();
+        let entry = ledger.append(kind, key, key, summary, now);
+        (
+            entry.seq,
+            entry.hash.clone(),
+            serde_json::to_string(entry).unwrap_or_default(),
+        )
+    };
+    let object_key = format!("{key}/{seq:020}-{hash}.json");
+    if durable {
+        if !crate::ledger_sink::persist_blocking(st.config.ledger_bucket.clone(), object_key, body)
+            .await
+        {
+            tracing::error!(%key, "TRIPWIRE ledger entry could not be durably persisted");
+        }
+    } else {
+        crate::ledger_sink::persist(st.config.ledger_bucket.clone(), object_key, body);
+    }
+    // Write-through the new head so a cold restart resumes here (best-effort — the entry itself is
+    // already in the immutable sink; a lost head pointer only costs chain continuity, not evidence).
+    if let Err(e) = st.store.save_ledger_head(key, seq, &hash).await {
+        tracing::warn!(%key, "ledger head persist failed: {e}");
+    }
+    (seq, hash)
+}
+
+/// Routine ledger append (fire-and-forget immutable-sink write).
+async fn append_ledger(
     st: &GateState,
     key: &str,
     kind: EntryKind,
     summary: String,
     now: u64,
 ) -> (u64, String) {
-    let mut ledgers = st.ledgers.lock().expect("ledger store poisoned");
-    let ledger = ledgers.entry(key.to_string()).or_default();
-    let entry = ledger.append(kind, key, key, summary, now);
-    crate::ledger_sink::persist(
-        st.config.ledger_bucket.clone(),
-        format!("{key}/{:020}-{}.json", entry.seq, entry.hash),
-        serde_json::to_string(entry).unwrap_or_default(),
-    );
-    (entry.seq, entry.hash.clone())
+    record_ledger(st, key, kind, summary, now, false).await
+}
+
+/// Append + DURABLY persist before returning (awaits the immutable-sink write). Reserved for
+/// high-signal TRIPWIRE evidence, which must not be lost to a fire-and-forget spawn if the environment
+/// is torn down right after the response. The trailing `bool` is retained for call-site symmetry.
+async fn append_ledger_durable(
+    st: &GateState,
+    key: &str,
+    kind: EntryKind,
+    summary: String,
+    now: u64,
+) -> (u64, String, bool) {
+    let (seq, hash) = record_ledger(st, key, kind, summary, now, true).await;
+    (seq, hash, true)
 }
 
 /// A proposed code execution plus the identity needed to attribute a honeypot tripwire (`agent_id`
@@ -1308,13 +1420,14 @@ async fn sandbox_validate(
         } else {
             req.thread_id.clone()
         };
-        let (seq, hash) = append_ledger(
+        let (seq, hash, _durable) = append_ledger_durable(
             &st,
             &key,
             EntryKind::Tripwire,
             format!("honeypot decoy touched: {decoy}"),
             now,
-        );
+        )
+        .await;
         // (b) Escalate at the agent level: quarantine (reintegration needs fresh attestation + a
         //     human). A subsequent `/mediate` for this agent is then refused deterministically.
         let quarantined = !req.agent_id.is_empty();
@@ -1553,6 +1666,53 @@ mod tests {
         assert_eq!(body["decision"], "human_approve");
         assert_eq!(body["capability"]["is_trifecta"], true);
         assert_eq!(body["ledger"]["seq"], 1);
+    }
+
+    #[tokio::test]
+    async fn caller_cannot_downgrade_provenance_by_default() {
+        // A compromised caller marks untrusted input as "user" to dodge the leg-A taint. By default
+        // the gate ignores the claim and treats the args as Untrusted, so leg A is still set.
+        let app = app();
+        let (_s, body) = post(
+            app,
+            "/mediate",
+            call(
+                "t1",
+                "db.read_patient",
+                serde_json::json!({"patient_id": "p1"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(body["decision"], "allow"); // A + B, not yet the trifecta
+        assert_eq!(
+            body["capability"]["reads_untrusted"], true,
+            "a 'user' claim must not suppress the untrusted-input leg"
+        );
+    }
+
+    #[tokio::test]
+    async fn provenance_is_honored_only_when_explicitly_trusted() {
+        // With provenance-trust enabled, a "user" claim is honored (leg A NOT set).
+        let app = router(
+            test_broker(),
+            GateConfig {
+                trust_arg_provenance: true,
+                ..Default::default()
+            },
+        );
+        let (_s, body) = post(
+            app,
+            "/mediate",
+            call(
+                "t1",
+                "db.read_patient",
+                serde_json::json!({"patient_id": "p1"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(body["capability"]["reads_untrusted"], false);
     }
 
     #[tokio::test]
@@ -2101,6 +2261,254 @@ mod tests {
         .await;
         assert_eq!(b["decision"], "human_approve");
         assert_eq!(b["capability"]["is_trifecta"], true);
+    }
+
+    // ── Audit-ledger cross-restart continuity (Part 1) ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn ledger_chain_survives_cold_resume() {
+        let store = MemStore::default();
+        // Gate #1: two decisions on t1 -> seq 0, 1. The head is written through after each.
+        let g1 = app_with_store(store.clone());
+        let (_s, b0) = post(
+            g1.clone(),
+            "/mediate",
+            call(
+                "t1",
+                "web.fetch",
+                serde_json::json!({"url": "https://x"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(b0["ledger"]["seq"], 0);
+        let (_s, b1) = post(
+            g1,
+            "/mediate",
+            call(
+                "t1",
+                "web.fetch",
+                serde_json::json!({"url": "https://y"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(b1["ledger"]["seq"], 1);
+        // The durable head now reflects seq 1.
+        let (hseq, hhash) = store
+            .load_ledger_head("t1")
+            .unwrap()
+            .expect("head persisted");
+        assert_eq!(hseq, 1);
+        assert_eq!(hhash, b1["ledger"]["hash"].as_str().unwrap());
+
+        // Gate #2 is a COLD process over the same store. The next decision RESUMES at seq 2 instead
+        // of restarting at genesis (seq 0).
+        let g2 = app_with_store(store.clone());
+        let (_s, b2) = post(
+            g2,
+            "/mediate",
+            call(
+                "t1",
+                "web.fetch",
+                serde_json::json!({"url": "https://z"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(
+            b2["ledger"]["seq"], 2,
+            "chain resumes across the cold restart"
+        );
+        let (hseq2, _h) = store.load_ledger_head("t1").unwrap().unwrap();
+        assert_eq!(hseq2, 2);
+    }
+
+    #[tokio::test]
+    async fn ledger_head_is_written_through_after_every_append() {
+        let store = MemStore::default();
+        let app = app_with_store(store.clone());
+        for expected in 0..4u64 {
+            let (_s, b) = post(
+                app.clone(),
+                "/mediate",
+                call(
+                    "t1",
+                    "web.fetch",
+                    serde_json::json!({"url": "https://x"}),
+                    "user",
+                ),
+            )
+            .await;
+            assert_eq!(b["ledger"]["seq"], expected);
+            let (seq, hash) = store.load_ledger_head("t1").unwrap().unwrap();
+            assert_eq!(seq, expected);
+            assert_eq!(
+                hash,
+                b["ledger"]["hash"].as_str().unwrap(),
+                "head matches the last entry"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn separate_threads_keep_independent_ledger_chains() {
+        let store = MemStore::default();
+        let g1 = app_with_store(store.clone());
+        // t1 gets two entries, t2 one.
+        post(
+            g1.clone(),
+            "/mediate",
+            call(
+                "t1",
+                "web.fetch",
+                serde_json::json!({"url": "https://x"}),
+                "user",
+            ),
+        )
+        .await;
+        post(
+            g1.clone(),
+            "/mediate",
+            call(
+                "t1",
+                "web.fetch",
+                serde_json::json!({"url": "https://y"}),
+                "user",
+            ),
+        )
+        .await;
+        post(
+            g1,
+            "/mediate",
+            call(
+                "t2",
+                "web.fetch",
+                serde_json::json!({"url": "https://z"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(store.load_ledger_head("t1").unwrap().unwrap().0, 1);
+        assert_eq!(store.load_ledger_head("t2").unwrap().unwrap().0, 0);
+
+        // A cold gate resumes EACH thread from its own head, independently.
+        let g2 = app_with_store(store.clone());
+        let (_s, bt2) = post(
+            g2.clone(),
+            "/mediate",
+            call(
+                "t2",
+                "web.fetch",
+                serde_json::json!({"url": "https://z2"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(
+            bt2["ledger"]["seq"], 1,
+            "t2 resumes at 1, not affected by t1"
+        );
+        let (_s, bt1) = post(
+            g2,
+            "/mediate",
+            call(
+                "t1",
+                "web.fetch",
+                serde_json::json!({"url": "https://x2"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(bt1["ledger"]["seq"], 2, "t1 resumes at 2");
+    }
+
+    #[tokio::test]
+    async fn ledger_resumes_across_three_cold_restarts() {
+        let store = MemStore::default();
+        for expected in 0..3u64 {
+            // A brand-new gate each iteration = three separate cold environments.
+            let g = app_with_store(store.clone());
+            let (_s, b) = post(
+                g,
+                "/mediate",
+                call(
+                    "t1",
+                    "web.fetch",
+                    serde_json::json!({"url": "https://x"}),
+                    "user",
+                ),
+            )
+            .await;
+            assert_eq!(
+                b["ledger"]["seq"], expected,
+                "seq keeps climbing across restarts"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tripwire_ledger_resumes_on_a_cold_gate_and_quarantines() {
+        let store = MemStore::default();
+        // A prior decision on t1 (seq 0).
+        let g1 = app_with_store(store.clone());
+        post(
+            g1,
+            "/mediate",
+            call(
+                "t1",
+                "web.fetch",
+                serde_json::json!({"url": "https://x"}),
+                "user",
+            ),
+        )
+        .await;
+
+        // A COLD gate with a configured canary: a canary in the tool args is a tripwire, and its
+        // immutable evidence must CONTINUE the chain (seq 1), not restart at 0.
+        let g2 = app_with_store_canary(store.clone());
+        let (status, b) = post(
+            g2,
+            "/mediate",
+            call(
+                "t1",
+                "web.fetch",
+                serde_json::json!({"url": "https://x?leak=CANARY-7f3a9b21e4c05d68"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK); // mediate returns 200 with a deny body
+        assert_eq!(b["decision"], "deny");
+        assert_eq!(b["tripwire"], true);
+        assert_eq!(b["ledger"]["seq"], 1, "tripwire evidence resumes the chain");
+        assert_eq!(store.load_ledger_head("t1").unwrap().unwrap().0, 1);
+    }
+
+    #[tokio::test]
+    async fn store_outage_still_records_a_deny_without_panicking() {
+        // If the store is unreachable, /mediate fails closed (deny) and STILL emits a ledger entry
+        // (best-effort, from a fresh segment) rather than dropping the audit record or crashing.
+        let store = MemStore::default();
+        store.set_failing(true);
+        let app = app_with_store(store);
+        let (_s, b) = post(
+            app,
+            "/mediate",
+            call(
+                "t1",
+                "web.fetch",
+                serde_json::json!({"url": "https://x"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(b["decision"], "deny");
+        assert_eq!(b["reason"], "session state unavailable");
+        assert!(
+            b["ledger"]["seq"].is_u64(),
+            "a deny entry is still recorded"
+        );
     }
 
     #[tokio::test]

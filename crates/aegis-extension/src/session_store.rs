@@ -150,6 +150,30 @@ impl SessionStore {
             Self::Mem(m) => m.save_quarantine(agent_id, reason),
         }
     }
+
+    /// Load a thread's durable audit-ledger head `(last_seq, last_hash)`, so a cold start resumes the
+    /// hash chain instead of restarting at genesis. `Ok(None)` ⇒ no prior entries. `Err` ⇒ the store
+    /// could not be consulted.
+    pub async fn load_ledger_head(&self, thread_id: &str) -> StoreResult<Option<(u64, String)>> {
+        match self {
+            Self::Null => Ok(None),
+            #[cfg(feature = "dynamodb")]
+            Self::Dynamo(d) => d.load_ledger_head(thread_id).await,
+            #[cfg(test)]
+            Self::Mem(m) => m.load_ledger_head(thread_id),
+        }
+    }
+
+    /// Write-through a thread's audit-ledger head after appending an entry.
+    pub async fn save_ledger_head(&self, thread_id: &str, seq: u64, hash: &str) -> StoreResult<()> {
+        match self {
+            Self::Null => Ok(()),
+            #[cfg(feature = "dynamodb")]
+            Self::Dynamo(d) => d.save_ledger_head(thread_id, seq, hash).await,
+            #[cfg(test)]
+            Self::Mem(m) => m.save_ledger_head(thread_id, seq, hash),
+        }
+    }
 }
 
 // ── DynamoDB backend (feature `dynamodb`) ───────────────────────────────────────────────────────
@@ -159,6 +183,7 @@ impl SessionStore {
 // from colliding, and keep taint separate from meter:
 //   PK="thread#<id>", SK="aegis#cap"        -> Capability JSON in `value`
 //   PK="thread#<id>", SK="aegis#meter"      -> MeterSnapshot JSON in `value`
+//   PK="thread#<id>", SK="aegis#ledger"     -> {seq,hash} audit-ledger head in `value`
 //   PK="agent#<id>",  SK="aegis#quarantine" -> quarantine marker JSON in `value`
 // Reads are strongly consistent, so a genuinely-absent item is distinguishable from a lost write.
 #[cfg(feature = "dynamodb")]
@@ -280,6 +305,40 @@ mod dynamo {
             self.put_value(format!("agent#{agent_id}"), "aegis#quarantine", value)
                 .await
         }
+
+        pub async fn load_ledger_head(
+            &self,
+            thread_id: &str,
+        ) -> StoreResult<Option<(u64, String)>> {
+            match self
+                .get_value(format!("thread#{thread_id}"), "aegis#ledger")
+                .await?
+            {
+                Some(json) => {
+                    let v: serde_json::Value = serde_json::from_str(&json)
+                        .map_err(|e| StoreError(format!("ledger head parse failed: {e}")))?;
+                    match (
+                        v.get("seq").and_then(serde_json::Value::as_u64),
+                        v.get("hash").and_then(serde_json::Value::as_str),
+                    ) {
+                        (Some(seq), Some(hash)) => Ok(Some((seq, hash.to_string()))),
+                        _ => Err(StoreError("ledger head missing seq/hash".into())),
+                    }
+                }
+                None => Ok(None),
+            }
+        }
+
+        pub async fn save_ledger_head(
+            &self,
+            thread_id: &str,
+            seq: u64,
+            hash: &str,
+        ) -> StoreResult<()> {
+            let value = serde_json::json!({ "seq": seq, "hash": hash }).to_string();
+            self.put_value(format!("thread#{thread_id}"), "aegis#ledger", value)
+                .await
+        }
     }
 }
 
@@ -300,6 +359,7 @@ pub mod mem {
     pub struct MemStore {
         caps: Arc<Mutex<HashMap<String, String>>>,
         meters: Arc<Mutex<HashMap<String, String>>>,
+        ledger_heads: Arc<Mutex<HashMap<String, String>>>,
         quarantined: Arc<Mutex<HashSet<String>>>,
         fail: Arc<AtomicBool>,
     }
@@ -363,6 +423,29 @@ pub mod mem {
                 .lock()
                 .unwrap()
                 .insert(agent_id.to_string());
+            Ok(())
+        }
+        pub fn load_ledger_head(&self, thread_id: &str) -> StoreResult<Option<(u64, String)>> {
+            self.guard()?;
+            match self.ledger_heads.lock().unwrap().get(thread_id) {
+                Some(s) => {
+                    let v: serde_json::Value =
+                        serde_json::from_str(s).map_err(|e| StoreError(e.to_string()))?;
+                    Ok(Some((
+                        v["seq"].as_u64().unwrap_or(0),
+                        v["hash"].as_str().unwrap_or("").to_string(),
+                    )))
+                }
+                None => Ok(None),
+            }
+        }
+        pub fn save_ledger_head(&self, thread_id: &str, seq: u64, hash: &str) -> StoreResult<()> {
+            self.guard()?;
+            let value = serde_json::json!({ "seq": seq, "hash": hash }).to_string();
+            self.ledger_heads
+                .lock()
+                .unwrap()
+                .insert(thread_id.to_string(), value);
             Ok(())
         }
     }

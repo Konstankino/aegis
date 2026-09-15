@@ -233,6 +233,35 @@ def redact_text(text):
     return "[redaction unavailable — content omitted]", 0
 
 
+# ── Output scanning (LLM02/LLM07) ───────────────────────────────────────────────────────────────
+SAFE_BLOCK = "[blocked: output failed a safety scan]"
+
+
+def scan_output(thread_id, text):
+    """Scan outgoing model text through the plane's `/output/scan` (PHI/PII leak + canary /
+    system-prompt-leak) before it leaves this stage. Returns True to allow.
+
+    Fail-closed: a deny (422) OR an unreachable gate returns False — the gate was health-checked at
+    turn start, so a failure here is treated as 'do not emit', never as a pass."""
+    if not text:
+        return True
+    try:
+        status, _ = _gate_post("/output/scan", {"thread_id": thread_id, "response": text})
+        return status == 200
+    except Exception:  # noqa: BLE001 — never let a scan failure leak unscanned output
+        return False
+
+
+def guarded_output(thread_id, value):
+    """Scan an outgoing value before it is returned (a final answer, or a stage handoff to the next
+    agent). Accepts a string or a list of candidate strings; returns a safe placeholder in place of
+    any content that fails the scan, so nothing unsafe moves downstream."""
+    if isinstance(value, list):
+        joined = "\n".join(str(v) for v in value)
+        return value if scan_output(thread_id, joined) else [SAFE_BLOCK]
+    return value if scan_output(thread_id, value or "") else SAFE_BLOCK
+
+
 # ── Checkpoint (DynamoDB, KMS-encrypted) ────────────────────────────────────────────────────────
 def load_messages(thread_id):
     if not _ddb:
@@ -382,8 +411,11 @@ def handler(event, context):
         # 3) Tool call, or final answer?
         tool_use = next((c["toolUse"] for c in out["content"] if "toolUse" in c), None)
         if not tool_use:
+            # Final answer: scan it before it reaches the user (LLM02) — never emit unscanned model
+            # output.
+            answer = guarded_output(thread_id, text_of(out))
             save_messages(thread_id, messages)
-            return {"status": "done", "answer": text_of(out), "thread_id": thread_id}
+            return {"status": "done", "answer": answer, "thread_id": thread_id}
 
         fq = profile["name_map"].get(tool_use["name"], tool_use["name"])
 
@@ -411,8 +443,11 @@ def handler(event, context):
         terminal = profile["terminal"].get(fq)
         if terminal:
             result_key, arg_key = terminal
+            # Scan the handoff BEFORE it moves to the next stage — a compromised agent must not pass
+            # leaked/unsafe content down the chain.
+            payload = guarded_output(thread_id, tool_use["input"].get(arg_key))
             save_messages(thread_id, messages)
-            return {"status": "done", result_key: tool_use["input"].get(arg_key), "thread_id": thread_id}
+            return {"status": "done", result_key: payload, "thread_id": thread_id}
 
         messages.append(tool_result_msg(tool_use["toolUseId"], result))
 

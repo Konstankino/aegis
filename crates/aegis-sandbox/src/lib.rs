@@ -95,9 +95,18 @@ impl SandboxPolicy {
     }
 
     /// Decide whether `req` may execute under this policy.
+    ///
+    /// NOTE on trust: `approved`, `wants_root` and `wants_network` are **caller-asserted advisories**,
+    /// not enforcement — a compromised caller could lie (claim `approved`, or `wants_network = false`
+    /// while the code opens a socket). They are cheap early rejections; the ACTUAL containment is
+    /// architectural and lives outside this deterministic screen: the code runs in a separate,
+    /// non-root, no-IAM Lambda with a deny-all-egress VPC and an ephemeral `/tmp`, so a false claim
+    /// still reaches nothing. `target_path` and the destructive-command denylist are likewise
+    /// best-effort screens in front of that isolation, not a substitute for it.
     #[must_use]
     pub fn validate(&self, req: &ExecRequest) -> ExecDecision {
-        // 1. Generation vs execution: unvalidated code never runs.
+        // 1. Generation vs execution: a well-behaved caller sets this once the generation→execution
+        //    two-step has run. Advisory (see the note above), but a cheap first gate.
         if !req.approved {
             return ExecDecision::Deny("code must pass the generation→execution gate first");
         }
@@ -109,9 +118,14 @@ impl SandboxPolicy {
         if req.wants_network && !self.allow_network {
             return ExecDecision::Deny("network not permitted (route via egress)");
         }
-        // 4. Path confinement to the ephemeral working directory.
+        // 4. Path confinement to the ephemeral working directory. Match on a real path boundary —
+        //    the working dir itself, or a child under a `/` separator. A bare `starts_with` would let
+        //    a SIBLING directory through (`/tmp/aegis-sandbox-evil` starts with `/tmp/aegis-sandbox`),
+        //    escaping confinement.
         if let Some(path) = &req.target_path {
-            if path.contains("..") || !path.starts_with(&self.working_dir) {
+            let wd = self.working_dir.trim_end_matches('/');
+            let confined = path == wd || path.starts_with(&format!("{wd}/"));
+            if path.contains("..") || !confined {
                 return ExecDecision::Deny("path escapes the sandbox working directory");
             }
         }
@@ -236,10 +250,28 @@ mod tests {
         let mut r = approved("write");
         r.target_path = Some("/tmp/aegis-sandbox/out.txt".into());
         assert!(p.validate(&r).is_allow());
+        // The working dir itself is allowed.
+        let mut r = approved("write");
+        r.target_path = Some("/tmp/aegis-sandbox".into());
+        assert!(p.validate(&r).is_allow());
         // Traversal within the prefix is still rejected.
         let mut r = approved("write");
         r.target_path = Some("/tmp/aegis-sandbox/../../etc/passwd".into());
         assert!(!p.validate(&r).is_allow());
+        // A SIBLING directory that merely shares the prefix must NOT be treated as confined.
+        for escape in [
+            "/tmp/aegis-sandbox-evil/out.txt",
+            "/tmp/aegis-sandboxED/x",
+            "/tmp/aegis-sandbox.bak",
+        ] {
+            let mut r = approved("write");
+            r.target_path = Some(escape.into());
+            assert_eq!(
+                p.validate(&r),
+                ExecDecision::Deny("path escapes the sandbox working directory"),
+                "{escape} must be rejected as outside the working dir"
+            );
+        }
     }
 
     #[test]

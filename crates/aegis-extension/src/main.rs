@@ -142,6 +142,12 @@ async fn main() -> Result<(), Error> {
             .ok()
             .filter(|s| !s.is_empty()),
         store: Some(session_store),
+        // Off unless explicitly enabled: by default the gate ignores a caller's provenance claim and
+        // treats every tool-call argument as untrusted (a compromised agent must not downgrade taint).
+        trust_arg_provenance: matches!(
+            std::env::var("AEGIS_TRUST_ARG_PROVENANCE").as_deref(),
+            Ok("1") | Ok("true")
+        ),
         honeypots: {
             // Per-project decoys/static canaries from S3 (honeypots.json), with the layer-baked
             // file as fallback, plus the per-project RUNTIME canary (AEGIS_CANARY) merged on top.
@@ -152,6 +158,15 @@ async fn main() -> Result<(), Error> {
             h
         },
     };
+
+    // Surface the audit-trail durability posture at boot: without an Object-Lock bucket the ledger is
+    // in-memory only (lost on cold start), and even tripwire evidence cannot be durably anchored.
+    if gate_config.ledger_bucket.is_none() {
+        tracing::warn!(
+            "durable audit ledger DISABLED (AEGIS_LEDGER_BUCKET unset): the tamper-evident chain is \
+             in-memory only and is lost on a cold start; configure an S3 Object Lock bucket in prod"
+        );
+    }
 
     // Every gate request gets an HTTP span (method/path/status/latency); combined with the OTLP
     // layer these export as traces, and are plain logs otherwise.

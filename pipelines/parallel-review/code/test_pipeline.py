@@ -194,17 +194,19 @@ class EngineEndToEndTest(unittest.TestCase):
             return {"decision": "allow"} if ok else {"decision": "deny", "reason": "policy denies this"}
 
         self._orig = (agent.bedrock, agent.mediate, agent._wait_for_gate, agent.preflight,
-                      agent.save_messages, agent.load_messages)
+                      agent.save_messages, agent.load_messages, agent.scan_output)
         agent.bedrock = _ScriptedModel()
         agent.mediate = fake_mediate
         agent._wait_for_gate = lambda *a, **k: True
         agent.preflight = lambda *a, **k: {"decision": "allow"}
         agent.save_messages = lambda *a, **k: None
         agent.load_messages = lambda *a, **k: None
+        agent.scan_output = lambda *a, **k: True  # output scan allows in these E2E tests
 
     def tearDown(self):
         a = self.agent
-        (a.bedrock, a.mediate, a._wait_for_gate, a.preflight, a.save_messages, a.load_messages) = self._orig
+        (a.bedrock, a.mediate, a._wait_for_gate, a.preflight, a.save_messages, a.load_messages,
+         a.scan_output) = self._orig
 
     def test_agent_a_dispatches_prepared_text(self):
         out = self.agent.handler({"agent_id": "agent-a", "thread_id": "t", "input": "he go"}, None)

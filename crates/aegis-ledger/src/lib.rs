@@ -105,22 +105,55 @@ pub enum LedgerError {
 
 /// An append-only, hash-chained audit ledger held in memory. Entries also serialize to JSONL for
 /// an external immutable sink; this type owns the chaining and verification.
-#[derive(Debug, Clone, Default)]
+///
+/// A ledger may be **resumed** from a durable checkpoint ([`Ledger::resume`]) so the chain continues
+/// across a cold restart instead of restarting at genesis: `start_seq` / `start_head` are the seq and
+/// prev-hash the first in-memory entry chains from. The prior entries live in the immutable sink, not
+/// here — [`Ledger::verify`] checks this in-memory segment relative to its checkpoint, and full-history
+/// verification walks the sink.
+#[derive(Debug, Clone)]
 pub struct Ledger {
     entries: Vec<LedgerEntry>,
+    start_seq: u64,
+    start_head: String,
+}
+
+impl Default for Ledger {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            start_seq: 0,
+            start_head: GENESIS_HASH.to_string(),
+        }
+    }
 }
 
 impl Ledger {
-    /// A new, empty ledger.
+    /// A new, empty ledger chaining from genesis.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// The current head hash (the last entry's hash, or [`GENESIS_HASH`] when empty).
+    /// Resume a chain from a durable checkpoint: the next appended entry carries `next_seq` and chains
+    /// from `head_hash`. Used on a cold restart so the audit chain is continuous instead of forking a
+    /// fresh genesis chain. See the type docs.
+    #[must_use]
+    pub fn resume(next_seq: u64, head_hash: impl Into<String>) -> Self {
+        Self {
+            entries: Vec::new(),
+            start_seq: next_seq,
+            start_head: head_hash.into(),
+        }
+    }
+
+    /// The current head hash: the last entry's hash, or the checkpoint head ([`GENESIS_HASH`] for a
+    /// fresh ledger) when the in-memory segment is empty.
     #[must_use]
     pub fn head(&self) -> &str {
-        self.entries.last().map_or(GENESIS_HASH, |e| &e.hash)
+        self.entries
+            .last()
+            .map_or(self.start_head.as_str(), |e| e.hash.as_str())
     }
 
     /// Number of entries.
@@ -153,7 +186,7 @@ impl Ledger {
         summary: impl Into<String>,
         ts_ms: u64,
     ) -> &LedgerEntry {
-        let seq = self.entries.len() as u64;
+        let seq = self.start_seq + self.entries.len() as u64;
         let prev_hash = self.head().to_string();
         let run_id = run_id.into();
         let thread_id = thread_id.into();
@@ -176,9 +209,9 @@ impl Ledger {
     /// Verify the whole chain: contiguous sequence, intact links, and matching hashes. Any
     /// tampering (edit, reorder, deletion) is detected.
     pub fn verify(&self) -> Result<(), LedgerError> {
-        let mut prev = GENESIS_HASH.to_string();
+        let mut prev = self.start_head.clone();
         for (i, e) in self.entries.iter().enumerate() {
-            if e.seq != i as u64 {
+            if e.seq != self.start_seq + i as u64 {
                 return Err(LedgerError::BadSequence { seq: e.seq });
             }
             if e.prev_hash != prev {
@@ -461,6 +494,117 @@ mod tests {
     #[test]
     fn hashes_are_deterministic_across_ledgers() {
         assert_eq!(seed().head(), seed().head());
+    }
+
+    #[test]
+    fn resume_continues_the_chain_from_a_checkpoint() {
+        // Pretend seq 0..2 already exist in the durable sink; the last one's (seq, hash) is the head.
+        let prior = seed();
+        let head = prior.head().to_string();
+        let next_seq = prior.len() as u64; // 3
+
+        // A cold environment resumes from that checkpoint rather than restarting at genesis.
+        let mut resumed = Ledger::resume(next_seq, head.clone());
+        assert_eq!(
+            resumed.head(),
+            head,
+            "empty resumed ledger heads at the checkpoint"
+        );
+        let e = resumed.append(EntryKind::Decision, "run1", "t1", "allow after resume", 4);
+        assert_eq!(e.seq, 3, "seq continues from the checkpoint, not 0");
+        assert_eq!(
+            e.prev_hash, head,
+            "chains from the durable head, not genesis"
+        );
+        let first_hash = e.hash.clone();
+
+        let e2 = resumed.append(EntryKind::ToolCall, "run1", "t1", "next", 5);
+        assert_eq!(e2.seq, 4);
+        assert_eq!(e2.prev_hash, first_hash);
+
+        // The in-memory segment verifies relative to its checkpoint.
+        assert!(resumed.verify().is_ok());
+    }
+
+    #[test]
+    fn chain_is_byte_identical_across_multiple_resumes() {
+        // The whole point of anchoring: a chain rebuilt across N cold restarts (a fresh `resume` from
+        // the persisted head each time) is IDENTICAL to the same chain built in one process.
+        let events = [
+            (EntryKind::Decision, "allow db.read", 1u64),
+            (EntryKind::ToolCall, "db.read executed", 2),
+            (EntryKind::Decision, "allow web.fetch", 3),
+            (EntryKind::Approval, "human approved", 4),
+            (EntryKind::Meter, "step 5", 5),
+            (EntryKind::Tripwire, "decoy touched", 6),
+        ];
+
+        // (a) One continuous process.
+        let mut single = Ledger::new();
+        for &(kind, summary, ts) in &events {
+            single.append(kind, "run1", "t1", summary, ts);
+        }
+        assert!(single.verify().is_ok());
+        let single_hashes: Vec<_> = single.entries().iter().map(|e| e.hash.clone()).collect();
+
+        // (b) Rebuilt as three 2-entry segments, each a cold restart resuming from the persisted head.
+        let mut head = GENESIS_HASH.to_string();
+        let mut next_seq = 0u64;
+        let mut rebuilt: Vec<String> = Vec::new();
+        for chunk in events.chunks(2) {
+            let mut seg = Ledger::resume(next_seq, head.clone());
+            for &(kind, summary, ts) in chunk {
+                seg.append(kind, "run1", "t1", summary, ts);
+            }
+            assert!(seg.verify().is_ok(), "each resumed segment verifies");
+            assert_eq!(
+                seg.entries()[0].prev_hash,
+                head,
+                "segment chains from the persisted head"
+            );
+            head = seg.head().to_string();
+            next_seq += chunk.len() as u64;
+            rebuilt.extend(seg.entries().iter().map(|e| e.hash.clone()));
+        }
+
+        assert_eq!(
+            rebuilt, single_hashes,
+            "segmented restarts reproduce the exact chain"
+        );
+        assert_eq!(head, single.head(), "final heads match");
+    }
+
+    #[test]
+    fn tampering_a_resumed_segment_is_detected() {
+        let mut l = Ledger::resume(7, "deadbeef");
+        l.append(EntryKind::Decision, "r", "t", "ok", 1); // seq 7, prev deadbeef
+        l.append(EntryKind::ToolCall, "r", "t", "next", 2); // seq 8
+        assert!(l.verify().is_ok());
+        // Edit a summary after the fact -> hash mismatch on that entry.
+        l.entries[0].summary = "ok (edited)".into();
+        assert_eq!(l.verify(), Err(LedgerError::HashMismatch { seq: 7 }));
+    }
+
+    #[test]
+    fn resume_from_genesis_behaves_like_a_fresh_ledger() {
+        let mut r = Ledger::resume(0, GENESIS_HASH);
+        let mut n = Ledger::new();
+        for i in 0..3 {
+            r.append(EntryKind::Decision, "run", "t", "x", i);
+            n.append(EntryKind::Decision, "run", "t", "x", i);
+        }
+        assert_eq!(r.head(), n.head());
+        assert!(r.verify().is_ok());
+    }
+
+    #[test]
+    fn a_resumed_segment_that_starts_at_the_wrong_seq_fails_verify() {
+        // A segment whose first entry does not sit at start_seq is a broken/forged resume.
+        let mut l = Ledger::resume(5, GENESIS_HASH);
+        l.append(EntryKind::Decision, "r", "t", "x", 1); // seq 5
+        assert!(l.verify().is_ok());
+        l.entries[0].seq = 6; // tamper: not the expected start_seq
+        assert_eq!(l.verify(), Err(LedgerError::BadSequence { seq: 6 }));
     }
 
     #[test]
