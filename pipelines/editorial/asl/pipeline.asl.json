@@ -1,0 +1,104 @@
+{
+  "Comment": "Editorial pipeline (Aegis scenario): a linear A -> B -> C chain. There are NO per-agent Lambdas — the SAME agent function is invoked three times with a different agent_id (the Cedar principal). Each invocation mediates every tool call through the Aegis inline-plane gate, which applies the per-agent least-privilege policy (pipelines/editorial/policies/broker.cedar).",
+  "StartAt": "Init",
+  "States": {
+    "Init": {
+      "Type": "Pass",
+      "Comment": "Seed the run: a thread id correlates the audit ledger + taint across the chain.",
+      "Parameters": {
+        "thread_id.$": "$$.Execution.Name",
+        "text.$": "$.input"
+      },
+      "Next": "AgentA_Grammar"
+    },
+    "AgentA_Grammar": {
+      "Type": "Task",
+      "Comment": "Agent A (principal agent-a): correct grammar, then call send.to_agent_b. May invoke ONLY grammar.correct + send.to_agent_b (broker-enforced).",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${agent_lambda_arn}",
+        "Payload": {
+          "agent_id": "agent-a",
+          "run_id.$": "$$.Execution.Name",
+          "thread_id.$": "$.thread_id",
+          "input.$": "$.text"
+        }
+      },
+      "ResultSelector": { "text.$": "$.Payload.output" },
+      "ResultPath": "$.a",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.TooManyRequestsException", "Lambda.ServiceException", "States.TaskFailed"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "Failed", "ResultPath": "$.error" }],
+      "Next": "AgentB_Enrich"
+    },
+    "AgentB_Enrich": {
+      "Type": "Task",
+      "Comment": "Agent B (principal agent-b): add interesting, sound facts, then call send.to_agent_c with BOTH versions as candidates. May invoke ONLY enrich.add_facts + send.to_agent_c.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${agent_lambda_arn}",
+        "Payload": {
+          "agent_id": "agent-b",
+          "run_id.$": "$$.Execution.Name",
+          "thread_id.$": "$.thread_id",
+          "input.$": "$.a.text"
+        }
+      },
+      "ResultSelector": { "candidates.$": "$.Payload.candidates" },
+      "ResultPath": "$.b",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.TooManyRequestsException", "Lambda.ServiceException", "States.TaskFailed"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "Failed", "ResultPath": "$.error" }],
+      "Next": "AgentC_Referee"
+    },
+    "AgentC_Referee": {
+      "Type": "Task",
+      "Comment": "Agent C (principal agent-c): referee.select the best candidate, then publish.final. May invoke ONLY referee.select + publish.final.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${agent_lambda_arn}",
+        "Payload": {
+          "agent_id": "agent-c",
+          "run_id.$": "$$.Execution.Name",
+          "thread_id.$": "$.thread_id",
+          "candidates.$": "$.b.candidates"
+        }
+      },
+      "ResultSelector": { "final.$": "$.Payload.output" },
+      "ResultPath": "$.c",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.TooManyRequestsException", "Lambda.ServiceException", "States.TaskFailed"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "Failed", "ResultPath": "$.error" }],
+      "Next": "Respond"
+    },
+    "Respond": {
+      "Type": "Pass",
+      "Comment": "The referee's chosen final text.",
+      "Parameters": { "status": "done", "thread_id.$": "$.thread_id", "final.$": "$.c.final" },
+      "End": true
+    },
+    "Failed": {
+      "Type": "Fail",
+      "Error": "EditorialPipelineFailed",
+      "Cause": "A stage of the A->B->C pipeline failed; see $.error and the audit ledger."
+    }
+  }
+}

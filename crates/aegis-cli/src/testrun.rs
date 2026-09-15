@@ -207,7 +207,12 @@ pub fn issue(
         .with_context(|| format!("{cred_path} is not a valid identity Credential JSON"))?;
 
     let action_scope = scope.unwrap_or(&grant.required_scope);
+    // A local dry-run asks: "would THIS credential, presented by its rightful holder in its declared
+    // context, mint this grant?" — so the context mirrors the credential (subject included). The real
+    // gate instead sources subject/audience/session from the live request, so a borrowed credential is
+    // refused there; this tool cannot model a different requester without one, so it self-checks.
     let ctx = RequestContext {
+        subject: &cred.subject,
         audience: &cred.audience,
         purpose: &cred.purpose,
         session_id: &cred.session_id,

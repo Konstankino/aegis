@@ -1,6 +1,6 @@
-# Shared infrastructure built ONCE per stack and reused by every project's aegis-agent module:
+# Shared infrastructure built ONCE per stack and reused by every pipeline's aegis-pipeline module:
 # the aegis-extension Lambda layer, the customer-managed KMS CMK, and the policy S3 bucket
-# (each project uploads its policies under its own prefix).
+# (each pipeline uploads its policies under its own prefix).
 
 data "aws_caller_identity" "current" {}
 

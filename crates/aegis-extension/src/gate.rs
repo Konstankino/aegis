@@ -935,6 +935,12 @@ struct IssueRequest {
     /// The action scope requested (defaults to the grant's `required_scope`).
     #[serde(default)]
     action_scope: Option<String>,
+    /// The purpose the caller is acting under — an INDEPENDENT assertion by the orchestrator, checked
+    /// against the credential's declared purpose. Empty (the default) only matches a purpose-less
+    /// credential; a credential issued for a specific purpose then fails closed unless the request
+    /// names the same one. (Sourcing this from the credential would make the check tautological.)
+    #[serde(default)]
+    purpose: String,
     /// The tenant this request belongs to (Roadmap T1). Absent ⇒ the default tenant.
     #[serde(default)]
     tenant: Option<String>,
@@ -1003,10 +1009,16 @@ async fn credentials_issue(
         .action_scope
         .clone()
         .unwrap_or_else(|| grant.required_scope.clone());
+    // Build the presentation context from INDEPENDENT request facts, never from the presented
+    // credential — otherwise each check would compare the credential against itself (a tautology) and
+    // the credential would be a bearer token. The requester is `agent_id`; the resource is the grant's
+    // audience; the session is this thread. `verify` then enforces that the credential was actually
+    // issued to THIS principal, for THIS resource, in THIS session.
     let ctx = RequestContext {
-        audience: &req.credential.audience,
-        purpose: &req.credential.purpose,
-        session_id: &req.credential.session_id,
+        subject: &req.agent_id,
+        audience: &grant.audience,
+        purpose: &req.purpose,
+        session_id: &req.thread_id,
         action_scope: &action_scope,
     };
     let session_cap = session_cap(&st, &key);
@@ -2253,19 +2265,43 @@ mod tests {
         Keypair::from_seed(&[11u8; 32])
     }
 
-    fn signed_cred(audience: &str, scopes: &[&str], expires_at: u64) -> serde_json::Value {
+    // The purpose the standard request declares; the matching credential carries the same one.
+    const PURPOSE: &str = "triage";
+
+    // Fully-parameterised so a negative test can mismatch exactly ONE field (subject / audience /
+    // purpose / session) against the request. The gate builds its context from the request facts
+    // (agent_id / grant audience / declared purpose / thread), so these are the real binding inputs.
+    fn signed_cred_full(
+        subject: &str,
+        audience: &str,
+        purpose: &str,
+        session: &str,
+        scopes: &[&str],
+        expires_at: u64,
+    ) -> serde_json::Value {
         let cred = Credential::issue(
             &issuer_kp(),
-            "a",
+            subject,
             audience,
-            "triage",
-            "sess-1",
+            purpose,
+            session,
             "intent-xyz",
             scopes.iter().map(|s| s.to_string()).collect(),
             0,
             expires_at,
         );
         serde_json::to_value(&cred).unwrap()
+    }
+
+    // The credential that MATCHES the standard request: subject "a", session == the thread, purpose
+    // == PURPOSE. `thread` is the session it is bound to (the gate binds session to the thread).
+    fn signed_cred(
+        thread: &str,
+        audience: &str,
+        scopes: &[&str],
+        expires_at: u64,
+    ) -> serde_json::Value {
+        signed_cred_full("a", audience, PURPOSE, thread, scopes, expires_at)
     }
 
     fn read_grant() -> Grant {
@@ -2325,7 +2361,8 @@ mod tests {
     ) -> serde_json::Value {
         serde_json::json!({
             "agent_id": "a", "run_id": "r", "thread_id": thread,
-            "credential": cred, "grant_id": grant, "requested_ttl_secs": ttl
+            "credential": cred, "grant_id": grant, "requested_ttl_secs": ttl,
+            "purpose": PURPOSE
         })
     }
 
@@ -2338,7 +2375,7 @@ mod tests {
             issue_body(
                 "t1",
                 "nope",
-                signed_cred("patient-db", &["db.read"], FUTURE),
+                signed_cred("t1", "patient-db", &["db.read"], FUTURE),
                 60,
             ),
         )
@@ -2358,7 +2395,7 @@ mod tests {
             issue_body(
                 "t1",
                 "db-read",
-                signed_cred("patient-db", &["db.read"], 500),
+                signed_cred("t1", "patient-db", &["db.read"], 500),
                 60,
             ),
         )
@@ -2378,7 +2415,7 @@ mod tests {
             issue_body(
                 "t1",
                 "db-read",
-                signed_cred("other", &["db.read"], FUTURE),
+                signed_cred("t1", "other", &["db.read"], FUTURE),
                 60,
             ),
         )
@@ -2399,7 +2436,7 @@ mod tests {
             issue_body(
                 "t1",
                 "db-read",
-                signed_cred("patient-db", &["db.read"], FUTURE),
+                signed_cred("t1", "patient-db", &["db.read"], FUTURE),
                 60,
             ),
         )
@@ -2442,7 +2479,7 @@ mod tests {
             issue_body(
                 "tX",
                 "db-write",
-                signed_cred("patient-db", &["db.write"], FUTURE),
+                signed_cred("tX", "patient-db", &["db.write"], FUTURE),
                 30,
             ),
         )
@@ -2472,7 +2509,7 @@ mod tests {
             issue_body(
                 "t1",
                 "db-read",
-                signed_cred("patient-db", &["db.read"], FUTURE),
+                signed_cred("t1", "patient-db", &["db.read"], FUTURE),
                 60,
             ),
         )
@@ -2480,6 +2517,76 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["decision"], "deny");
         assert!(body["reason"].as_str().unwrap().contains("quarantined"));
+    }
+
+    // ── Credential binding: the gate builds its context from INDEPENDENT request facts, so a
+    //    validly-signed credential is NOT a bearer token. Each test below issues a credential that
+    //    is valid in every way except the ONE field it mismatches against the request — proving the
+    //    corresponding check actually fires (not a self-comparison). ──────────────────────────────
+
+    #[tokio::test]
+    async fn issue_wrong_subject_is_denied() {
+        // A perfectly valid, correctly-signed credential ISSUED TO "b" — but the request is made by
+        // agent "a" (issue_body's agent_id). Everything else matches (audience/purpose/session/scope),
+        // so only the subject binding can deny: the confused-deputy / bearer-token defense.
+        let app = app_with_grants(vec![read_grant()]);
+        let cred = signed_cred_full("b", "patient-db", PURPOSE, "t1", &["db.read"], FUTURE);
+        let (status, body) = post(
+            app,
+            "/credentials/issue",
+            issue_body("t1", "db-read", cred, 60),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["decision"], "deny");
+        assert_eq!(body["reason"], "subject mismatch");
+    }
+
+    #[tokio::test]
+    async fn issue_wrong_session_is_denied() {
+        // The credential is bound to a DIFFERENT session than the thread it is presented in — a
+        // captured credential cannot be replayed into another run.
+        let app = app_with_grants(vec![read_grant()]);
+        let cred = signed_cred_full(
+            "a",
+            "patient-db",
+            PURPOSE,
+            "some-other-thread",
+            &["db.read"],
+            FUTURE,
+        );
+        let (status, body) = post(
+            app,
+            "/credentials/issue",
+            issue_body("t1", "db-read", cred, 60),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["decision"], "deny");
+        assert_eq!(body["reason"], "session mismatch (re-auth required)");
+    }
+
+    #[tokio::test]
+    async fn issue_wrong_purpose_is_denied() {
+        // The request declares PURPOSE, but the credential was issued for a different purpose.
+        let app = app_with_grants(vec![read_grant()]);
+        let cred = signed_cred_full(
+            "a",
+            "patient-db",
+            "exfiltration",
+            "t1",
+            &["db.read"],
+            FUTURE,
+        );
+        let (status, body) = post(
+            app,
+            "/credentials/issue",
+            issue_body("t1", "db-read", cred, 60),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["decision"], "deny");
+        assert_eq!(body["reason"], "purpose mismatch");
     }
 
     // ── Typed span emission (Roadmap T0 wiring) ─────────────────────────────────────────────────

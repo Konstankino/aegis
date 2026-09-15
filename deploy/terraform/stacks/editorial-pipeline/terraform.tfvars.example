@@ -1,0 +1,28 @@
+# Deploy the built-in editorial pipeline with defaults:
+#
+#   terraform init && terraform apply
+#
+# To deploy one or more pipelines explicitly (each pointing at its pipelines/<name>/ directory):
+#
+# pipelines = {
+#   editorial = {
+#     pipeline_dir  = "../../../../pipelines/editorial"
+#     pipeline_name = "editorial"
+#     # model_id    = "anthropic.claude-sonnet-4-5-20250929-v1:0"
+#   }
+#   parallel_review = {
+#     pipeline_dir  = "../../../../pipelines/parallel-review"
+#     pipeline_name = "parallel-review"
+#   }
+#   # add another pipeline here — no module or shared-code change needed:
+#   # my_pipeline = { pipeline_dir = "../../../../pipelines/my-pipeline" }
+# }
+
+region       = "us-east-1"
+architecture = "arm64"
+
+# Egress containment + the optional RAG/Phoenix modules require a VPC.
+enable_vpc     = false
+enable_rag     = false
+enable_phoenix = false
+# phoenix_ui_cidrs = ["10.0.0.0/8"]

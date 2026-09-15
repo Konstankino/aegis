@@ -1,0 +1,8 @@
+# Editorial pipeline egress — default-deny; only Agent B's facts source is reachable.
+#
+# `enrich.add_facts` (Agent B) is the only tool with an outbound effect that leaves the plane; it may
+# reach the internal facts service and nothing else. Inter-agent handoffs (send.to_agent_b/c) travel
+# over the signed mesh, not this HTTP egress.
+schemes = ["https"]
+hosts = ["facts.internal.example"]
+suffixes = []

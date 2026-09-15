@@ -36,8 +36,18 @@ pub struct Credential {
 }
 
 /// The context a credential is being presented in.
+///
+/// Every field is an **independent** fact about the presentation — the presenting principal, the
+/// resource being reached, the session it happens in — supplied by the verifier, NOT copied from the
+/// credential. Populating any field from the credential itself turns the corresponding check in
+/// [`Credential::verify`] into a tautology (a value compared to itself), so callers must derive these
+/// from the request they are authorizing.
 #[derive(Debug, Clone)]
 pub struct RequestContext<'a> {
+    /// The principal actually presenting the credential — must equal the credential's `subject`.
+    /// This is the confused-deputy / bearer-token defense: a validly-signed credential is only
+    /// usable by the subject it was issued to.
+    pub subject: &'a str,
     pub audience: &'a str,
     pub purpose: &'a str,
     pub session_id: &'a str,
@@ -177,6 +187,12 @@ impl Credential {
         if now_ms >= self.expires_at {
             return AuthDecision::Deny("credential expired");
         }
+        // Subject binding: the credential is usable ONLY by the principal it was issued to. Without
+        // this a validly-signed credential is a bearer token — any holder could present it (the
+        // confused-deputy hole). `ctx.subject` is the actual requester, never the credential's own.
+        if self.subject != ctx.subject {
+            return AuthDecision::Deny("subject mismatch");
+        }
         if self.audience != ctx.audience {
             return AuthDecision::Deny("audience mismatch");
         }
@@ -275,8 +291,12 @@ mod tests {
         (kp, c)
     }
 
+    // The presentation context for the legitimate holder (`agent-a`). Tests that exercise a binding
+    // check mutate exactly ONE field to a value that differs from the credential, so the assertion
+    // proves the check fires — never a value copied from the credential (which would be tautological).
     fn ctx<'a>(scope: &'a str) -> RequestContext<'a> {
         RequestContext {
+            subject: "agent-a",
             audience: "billing-service",
             purpose: "refund",
             session_id: "sess-1",
@@ -288,6 +308,17 @@ mod tests {
     fn valid_credential_allows_in_scope_action() {
         let (_kp, c) = cred();
         assert_eq!(c.verify(200, &ctx("refund.read")), AuthDecision::Allow);
+    }
+
+    #[test]
+    fn wrong_subject_is_denied() {
+        // A validly-signed credential for agent-a, presented by a different principal, is refused —
+        // it is not a bearer token. (Audience/session/scope all still match, so only the subject
+        // binding can be what denies: a genuine, non-tautological check.)
+        let (_kp, c) = cred();
+        let mut cx = ctx("refund.read");
+        cx.subject = "agent-b";
+        assert_eq!(c.verify(200, &cx), AuthDecision::Deny("subject mismatch"));
     }
 
     #[test]
@@ -364,10 +395,20 @@ mod tests {
             .unwrap();
         assert_eq!(child.subject, "agent-b");
         assert!(child.signature_valid());
-        assert_eq!(child.verify(300, &ctx("refund.read")), AuthDecision::Allow);
-        // The narrowed child no longer grants the write scope.
+        // The delegated child is bound to its NEW subject (agent-b), so it must be presented as
+        // agent-b — proving subject binding survives delegation.
+        let mut as_b = ctx("refund.read");
+        as_b.subject = "agent-b";
+        assert_eq!(child.verify(300, &as_b), AuthDecision::Allow);
+        // Presented as the parent (agent-a), the child is refused — it is not the delegatee's to lend.
         assert_eq!(
-            child.verify(300, &ctx("refund.write")),
+            child.verify(300, &ctx("refund.read")),
+            AuthDecision::Deny("subject mismatch")
+        );
+        // And even as agent-b the narrowed child no longer grants the write scope.
+        as_b.action_scope = "refund.write";
+        assert_eq!(
+            child.verify(300, &as_b),
             AuthDecision::Deny("action scope not granted")
         );
     }

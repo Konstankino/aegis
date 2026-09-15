@@ -1,0 +1,74 @@
+[
+  {
+    "name": "grammar.correct",
+    "reaches_sensitive_data": false,
+    "has_external_effect": false,
+    "consequence": "low_reversible",
+    "schema": {
+      "type": "object",
+      "properties": { "text": { "type": "string" } },
+      "required": ["text"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "dispatch.to_workers",
+    "reaches_sensitive_data": false,
+    "has_external_effect": true,
+    "consequence": "low_reversible",
+    "schema": {
+      "type": "object",
+      "properties": { "text": { "type": "string" } },
+      "required": ["text"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "improve.text",
+    "reaches_sensitive_data": false,
+    "has_external_effect": false,
+    "consequence": "low_reversible",
+    "schema": {
+      "type": "object",
+      "properties": { "text": { "type": "string" } },
+      "required": ["text"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "submit.candidate",
+    "reaches_sensitive_data": false,
+    "has_external_effect": true,
+    "consequence": "low_reversible",
+    "schema": {
+      "type": "object",
+      "properties": { "text": { "type": "string" } },
+      "required": ["text"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "referee.select",
+    "reaches_sensitive_data": false,
+    "has_external_effect": false,
+    "consequence": "low_reversible",
+    "schema": {
+      "type": "object",
+      "properties": { "candidates": { "type": "array", "items": { "type": "string" } } },
+      "required": ["candidates"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "publish.final",
+    "reaches_sensitive_data": false,
+    "has_external_effect": true,
+    "consequence": "low_reversible",
+    "schema": {
+      "type": "object",
+      "properties": { "text": { "type": "string" } },
+      "required": ["text"],
+      "additionalProperties": false
+    }
+  }
+]

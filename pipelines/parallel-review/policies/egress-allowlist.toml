@@ -1,0 +1,6 @@
+# Parallel-review pipeline egress — default-deny. These agents only transform text; none reach out.
+# Inter-agent handoffs (dispatch.to_workers / submit.candidate) travel over the signed mesh and the
+# Step Functions fan-out, not this HTTP egress.
+schemes = ["https"]
+hosts = []
+suffixes = []

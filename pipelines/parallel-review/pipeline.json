@@ -1,0 +1,50 @@
+{
+  "name": "parallel-review",
+  "description": "Fan-out/fan-in: Agent A prepares the text and dispatches it to two peer writers, Agents B and C, who improve it IN PARALLEL. When both have submitted, Agent D referees and publishes the best version. B and C are peer principals with identical permissions.",
+  "stages": [
+    {
+      "agent_id": "agent-a",
+      "state": "AgentA_Prepare",
+      "branch": "root",
+      "system": "You are an intake editor. Lightly correct the grammar of the user's text, then dispatch it to the parallel improvement agents by calling dispatch_to_workers with the text. Do nothing else.",
+      "tools": [
+        { "name": "grammar.correct", "description": "Return a grammar-corrected version of the text." },
+        { "name": "dispatch.to_workers", "description": "Dispatch the prepared text to the parallel improvement agents (B and C)." }
+      ],
+      "terminal": { "tool": "dispatch.to_workers", "output_key": "output", "arg_key": "text" }
+    },
+    {
+      "agent_id": "agent-b",
+      "state": "AgentB_Improve",
+      "branch": "Improve",
+      "system": "You are a writer. Produce the best improved version of the text you can — clearer, more engaging, still accurate — then submit it by calling submit_candidate with your version. Do nothing else.",
+      "tools": [
+        { "name": "improve.text", "description": "Produce an improved version of the text." },
+        { "name": "submit.candidate", "description": "Submit your improved version as a candidate." }
+      ],
+      "terminal": { "tool": "submit.candidate", "output_key": "output", "arg_key": "text" }
+    },
+    {
+      "agent_id": "agent-c",
+      "state": "AgentC_Improve",
+      "branch": "Improve",
+      "system": "You are a writer. Produce the best improved version of the text you can — clearer, more engaging, still accurate — then submit it by calling submit_candidate with your version. Do nothing else.",
+      "tools": [
+        { "name": "improve.text", "description": "Produce an improved version of the text." },
+        { "name": "submit.candidate", "description": "Submit your improved version as a candidate." }
+      ],
+      "terminal": { "tool": "submit.candidate", "output_key": "output", "arg_key": "text" }
+    },
+    {
+      "agent_id": "agent-d",
+      "state": "AgentD_Referee",
+      "branch": "root",
+      "system": "You are the referee. Read the candidate versions from the two writers and choose the single best one, then publish it by calling publish_final with the chosen text. Do nothing else.",
+      "tools": [
+        { "name": "referee.select", "description": "Record the chosen candidate." },
+        { "name": "publish.final", "description": "Publish the final chosen text." }
+      ],
+      "terminal": { "tool": "publish.final", "output_key": "output", "arg_key": "text" }
+    }
+  ]
+}

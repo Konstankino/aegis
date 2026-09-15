@@ -22,7 +22,10 @@ pub struct Allowlist {
     /// Exact hostnames that are permitted (e.g. `api.internal.example`).
     #[serde(default)]
     pub hosts: Vec<String>,
-    /// Domain suffixes that are permitted (e.g. `.s3.amazonaws.com`); matched against the host.
+    /// Domain suffixes that are permitted (e.g. `.s3.amazonaws.com` or `s3.amazonaws.com` — the
+    /// leading dot is optional). Matched on a DNS label boundary: a suffix permits its apex and any
+    /// subdomain of it, never a host that merely ends with the same characters across a label
+    /// boundary (`s3.amazonaws.com` does NOT permit `evils3.amazonaws.com`).
     #[serde(default)]
     pub suffixes: Vec<String>,
     /// Query-parameter names that may survive, keyed by host. A host absent from this map (or
@@ -125,9 +128,17 @@ impl Allowlist {
             return true;
         }
         self.suffixes.iter().any(|suf| {
-            let suf = suf.to_ascii_lowercase();
-            // A suffix like ".example.com" matches host or any subdomain of it.
-            host == suf.trim_start_matches('.') || host.ends_with(&suf)
+            // Normalize to the bare apex, then match ONLY on a DNS label boundary: the apex itself,
+            // or a subdomain of it. A plain `ends_with` would let a dotless suffix like
+            // `internal.example` also match `evil-internal.example` / `notinternal.example` — a
+            // cross-domain exfiltration bypass. Requiring `host == apex || host ends with ".apex"`
+            // closes that, and treats a dotted (`.example.com`) and dotless (`example.com`) suffix
+            // identically.
+            let apex = suf.trim().trim_start_matches('.').to_ascii_lowercase();
+            if apex.is_empty() {
+                return false;
+            }
+            host == apex || host.ends_with(&format!(".{apex}"))
         })
     }
 }
@@ -256,6 +267,60 @@ mod tests {
         match a.decide("https://my-bucket.s3.amazonaws.com/key") {
             EgressDecision::Allow(_) => {}
             other => panic!("expected allow, got {other:?}"),
+        }
+        // The apex itself is also permitted…
+        assert!(matches!(
+            a.decide("https://s3.amazonaws.com/key"),
+            EgressDecision::Allow(_)
+        ));
+    }
+
+    #[test]
+    fn suffix_does_not_match_across_a_label_boundary() {
+        // The dotted suffix `.s3.amazonaws.com` must NOT permit a look-alike host that merely ends
+        // with the same characters without a label boundary — the classic allowlist bypass.
+        let a = allowlist();
+        for host in [
+            "https://evils3.amazonaws.com/key",
+            "https://my-s3.amazonaws.com.attacker.net/key",
+        ] {
+            assert_eq!(
+                a.decide(host),
+                EgressDecision::Deny("host not on allowlist"),
+                "{host} must be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn dotless_suffix_is_still_boundary_matched() {
+        // A suffix written WITHOUT a leading dot is treated identically — apex + subdomains only,
+        // never a substring across a boundary.
+        let a = Allowlist::from_toml(
+            r#"
+                suffixes = ["internal.example"]
+                schemes = ["https"]
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            a.decide("https://api.internal.example/x"),
+            EgressDecision::Allow(_)
+        ));
+        assert!(matches!(
+            a.decide("https://internal.example/x"),
+            EgressDecision::Allow(_)
+        ));
+        for host in [
+            "https://evilinternal.example/x",
+            "https://notinternal.example/x",
+            "https://internal.example.attacker.net/x",
+        ] {
+            assert_eq!(
+                a.decide(host),
+                EgressDecision::Deny("host not on allowlist"),
+                "{host} must be denied"
+            );
         }
     }
 

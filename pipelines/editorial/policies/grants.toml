@@ -1,0 +1,3 @@
+# Editorial pipeline JIT grants — none needed: no agent requires a real cloud credential (the facts
+# source is reached via the egress allowlist, not a brokered secret). Default-deny.
+grants = []

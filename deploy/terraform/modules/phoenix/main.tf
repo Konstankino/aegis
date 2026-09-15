@@ -77,8 +77,8 @@ resource "aws_vpc_security_group_ingress_rule" "svc_from_lb" {
 resource "aws_vpc_security_group_egress_rule" "svc_egress" {
   security_group_id = aws_security_group.service.id
   description       = "Egress for image pull + Postgres."
-  ip_protocol      = "-1"
-  cidr_ipv4        = "0.0.0.0/0"
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
 }
 
 # ── Internal load balancer ─────────────────────────────────────────────────────────────────────────
@@ -166,9 +166,9 @@ resource "aws_ecs_task_definition" "this" {
   execution_role_arn       = aws_iam_role.execution.arn
 
   container_definitions = jsonencode([{
-    name      = "phoenix"
-    image     = var.image
-    essential = true
+    name         = "phoenix"
+    image        = var.image
+    essential    = true
     portMappings = [{ containerPort = local.port, protocol = "tcp" }]
     secrets = var.database_url_secret_arn == "" ? [] : [
       { name = "PHOENIX_SQL_DATABASE_URL", valueFrom = var.database_url_secret_arn }

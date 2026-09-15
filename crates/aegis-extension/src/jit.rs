@@ -45,7 +45,8 @@ pub struct MintedCredential {
     /// The secret material (never logged/persisted).
     #[serde(flatten)]
     pub payload: MintPayload,
-    /// Advisory expiry (Unix ms): now + the decision's clamped TTL.
+    /// Expiry (Unix ms): now + the decision's clamped TTL. For STS this is ENFORCED by the inline
+    /// session policy's time fence (not merely advisory); for a static secret it is advisory only.
     pub expires_at_ms: u64,
 }
 
@@ -75,18 +76,32 @@ pub async fn mint(
             let mut req = client
                 .assume_role()
                 .role_arn(role_arn)
-                .role_session_name(session_name)
+                // STS enforces a 900s floor on the token; the session policy below fences the REAL
+                // (short) expiry, so this is only the outer token lifetime.
                 .duration_seconds(clamp_sts_duration(ttl_secs))
+                .role_session_name(session_name)
                 // Session tags land in CloudTrail for per-agent attribution.
                 .tags(tag("aegis:agent", &ctx.agent_id))
                 .tags(tag("aegis:thread", &ctx.thread_id))
                 .tags(tag("aegis:intent", &ctx.intent_hash));
-            // The inline session policy narrows the (already narrow) role to exactly this resource.
-            if let Some(policy) = provider.rendered_session_policy() {
-                if !policy.trim().is_empty() {
-                    req = req.policy(policy);
-                }
-            }
+            // The inline session policy narrows the (already narrow) role to exactly this resource
+            // AND is time-fenced to the intended TTL: an explicit `Deny *` after `now + ttl` makes
+            // AWS refuse the credential once the short TTL elapses, defeating the 900s STS floor.
+            // An empty operator template means "narrow via the role only", so start from an allow-all
+            // the role intersects down; the fence still bounds it in time.
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let base = provider.rendered_session_policy().unwrap_or_default();
+            let base = if base.trim().is_empty() {
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#
+                    .to_string()
+            } else {
+                base
+            };
+            let fenced = aegis_jit::fence_session_policy(&base, now_secs.saturating_add(ttl_secs));
+            req = req.policy(fenced);
             // ExternalId ties the assume-call to this project (the per-grant role trust policy
             // requires it — jit.tf). Set from AEGIS_JIT_EXTERNAL_ID when present.
             if let Ok(external_id) = std::env::var("AEGIS_JIT_EXTERNAL_ID") {
@@ -169,8 +184,10 @@ fn tag(key: &str, value: &str) -> aws_sdk_sts::types::Tag {
 }
 
 /// STS `DurationSeconds` must be within [900, 43200]. A JIT credential is intentionally short, but
-/// STS refuses anything under 900s, so clamp up to the floor (the decision's own, tighter TTL is
-/// still recorded as the advisory `expires_at_ms`).
+/// STS refuses anything under 900s, so clamp the TOKEN lifetime up to the floor. The decision's own,
+/// tighter TTL is enforced separately by the inline session policy's `DateGreaterThan aws:CurrentTime`
+/// fence (see `aegis_jit::fence_session_policy`), so a 60s grant is unusable after 60s even though the
+/// token string remains parseable for 900s.
 #[cfg(feature = "jit")]
 fn clamp_sts_duration(ttl_secs: u64) -> i32 {
     ttl_secs.clamp(900, 43_200) as i32

@@ -111,9 +111,24 @@ pub fn load_sandbox_policy(policy_dir: &Path) -> aegis_sandbox::SandboxPolicy {
 /// Load the JIT grant catalog from `grants.toml`. An absent or malformed file yields the empty
 /// catalog — which denies every credential request (safe by default), mirroring the sandbox loader.
 pub fn load_grant_catalog(policy_dir: &Path) -> aegis_jit::GrantCatalog {
-    match std::fs::read_to_string(policy_dir.join("grants.toml")) {
-        Ok(src) => aegis_jit::GrantCatalog::from_toml(&src).unwrap_or_default(),
-        Err(_) => aegis_jit::GrantCatalog::default(),
+    let Ok(src) = std::fs::read_to_string(policy_dir.join("grants.toml")) else {
+        return aegis_jit::GrantCatalog::default();
+    };
+    match aegis_jit::GrantCatalog::from_toml(&src) {
+        // Validate at boot too — an invalid catalog (e.g. an STS grant with no resource_arns, which
+        // would mint a wildcard-scoped credential) fails CLOSED to the empty deny-all catalog rather
+        // than being trusted. The CLI validates on write; this guards a hand-edited or corrupted file.
+        Ok(cat) => match cat.validate() {
+            Ok(()) => cat,
+            Err(e) => {
+                tracing::error!("invalid grants.toml, denying all JIT issuance: {e}");
+                aegis_jit::GrantCatalog::default()
+            }
+        },
+        Err(e) => {
+            tracing::error!("unparseable grants.toml, denying all JIT issuance: {e}");
+            aegis_jit::GrantCatalog::default()
+        }
     }
 }
 

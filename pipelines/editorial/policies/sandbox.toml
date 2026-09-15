@@ -1,0 +1,6 @@
+# Editorial pipeline sandbox — locked-down default. These agents transform text; none run code.
+allow_root = false
+allow_network = false
+working_dir = "/tmp/aegis-sandbox"
+max_wall_ms = 5000
+max_memory_mb = 256

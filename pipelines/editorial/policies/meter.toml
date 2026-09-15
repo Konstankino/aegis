@@ -1,0 +1,11 @@
+# Editorial pipeline meter — a small, explicit budget for a 3-agent turn.
+max_tokens_per_request = 100000
+tokens_per_minute = 200000
+tokens_per_day = 5000000
+max_cost_per_request_usd = 0.50
+hard_cost_cap_usd = 20.0
+max_steps = 12
+max_recursion_depth = 4
+max_wall_clock_ms = 60000
+loop_repeat_threshold = 3
+max_fanout = 4

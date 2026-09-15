@@ -93,15 +93,90 @@ impl Provider {
                 ..
             } => {
                 let replacement = match resource_arns.as_slice() {
-                    [] => "*".to_string(),
+                    // Fail CLOSED, never open: a grant with no resource ARNs must NOT widen the
+                    // session policy to `*` (which would leave the assumed role un-narrowed — the
+                    // whole point of the inline policy is to scope it down). `GrantCatalog::validate`
+                    // rejects such grants; this sentinel is defense in depth if one slips through —
+                    // it matches no real ARN, so the session grants nothing.
+                    [] => NO_RESOURCE_SENTINEL.to_string(),
                     [one] => one.clone(),
-                    many => serde_json::to_string(many).unwrap_or_else(|_| "*".to_string()),
+                    many => serde_json::to_string(many)
+                        .unwrap_or_else(|_| NO_RESOURCE_SENTINEL.to_string()),
                 };
                 Some(session_policy_template.replace("{resource}", &replacement))
             }
             Provider::Secret { .. } => None,
         }
     }
+}
+
+/// A syntactically-valid ARN that matches no real resource. Used as the fail-closed substitution for
+/// an STS grant with no `resource_arns`, so its inline session policy grants access to nothing rather
+/// than everything.
+pub const NO_RESOURCE_SENTINEL: &str = "arn:aws:iam::000000000000:role/aegis-no-resource-deny";
+
+/// Format a Unix timestamp (seconds, UTC) as ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` — the shape AWS expects
+/// for an `aws:CurrentTime` policy condition. Pure (no external date crate) via Howard Hinnant's
+/// civil-from-days, so it is fully unit-testable.
+#[must_use]
+pub fn unix_to_iso8601(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let tod = secs % 86_400;
+    let (hh, mm, ss) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    let z = days + 719_468; // shift epoch so the era arithmetic stays non-negative
+    let era = z / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+/// Time-fence a rendered STS inline session policy: append an explicit `Deny *` on everything after
+/// `expiry_unix_secs`.
+///
+/// **Why:** STS enforces a 900-second FLOOR on a session token's `DurationSeconds`, so a credential
+/// meant to live 60–300s would otherwise be usable for the full 15 minutes — the returned
+/// `expires_at_ms` alone is only advisory. An explicit `Deny` guarded by
+/// `DateGreaterThan aws:CurrentTime` makes AWS itself refuse every action once the intended (short)
+/// TTL elapses, and an explicit Deny overrides the operator's `Allow`(s), which are preserved so the
+/// resource narrowing still holds before expiry.
+///
+/// The operator's statements are kept as-is and the fence is appended. If `rendered` is empty or not
+/// a JSON object, the result is the fence alone — a session policy with no `Allow` grants nothing
+/// (fail-closed).
+#[must_use]
+pub fn fence_session_policy(rendered: &str, expiry_unix_secs: u64) -> String {
+    let fence = serde_json::json!({
+        "Sid": "AegisJitExpiry",
+        "Effect": "Deny",
+        "Action": "*",
+        "Resource": "*",
+        "Condition": { "DateGreaterThan": { "aws:CurrentTime": unix_to_iso8601(expiry_unix_secs) } }
+    });
+
+    let mut doc = match serde_json::from_str::<serde_json::Value>(rendered.trim()) {
+        Ok(v @ serde_json::Value::Object(_)) => v,
+        _ => serde_json::json!({}),
+    };
+    let obj = doc.as_object_mut().expect("doc is an object");
+    obj.entry("Version".to_string())
+        .or_insert_with(|| serde_json::Value::String("2012-10-17".into()));
+    let mut statements = match obj.remove("Statement") {
+        Some(serde_json::Value::Array(a)) => a,
+        Some(other) => vec![other], // a single-statement object → wrap into an array
+        None => vec![],
+    };
+    statements.push(fence);
+    obj.insert(
+        "Statement".to_string(),
+        serde_json::Value::Array(statements),
+    );
+    serde_json::to_string(&doc).unwrap_or_default()
 }
 
 /// One entry of the versioned grant catalog (`grants.toml`). Declares who may mint what, for how
@@ -240,6 +315,18 @@ impl GrantCatalog {
                     "grant {} has max_ttl_secs = 0 (no positive lifetime)",
                     g.id
                 )));
+            }
+            // An STS grant MUST name at least one resource ARN. With none, the rendered inline
+            // session policy would scope the assumed role to `*` — i.e. NOT narrow it at all, the
+            // opposite of this control's purpose. Refuse it rather than mint a wildcard credential.
+            if let Provider::Sts { resource_arns, .. } = &g.provider {
+                if resource_arns.iter().all(|a| a.trim().is_empty()) {
+                    return Err(aegis_core::AegisError::Policy(format!(
+                        "STS grant {} has no resource_arns (would scope the session policy to all \
+                         resources); name the exact resource(s) it may reach",
+                        g.id
+                    )));
+                }
             }
         }
         Ok(())
@@ -393,13 +480,21 @@ mod tests {
         )
     }
 
-    fn ctx<'a>(scope: &'a str) -> RequestContext<'a> {
+    // The presentation context, parameterised by the presenting principal. `ctx` is the legitimate
+    // holder (agent-a); `ctx_as` lets a test present the credential as a DIFFERENT principal so the
+    // subject-binding check is exercised for real rather than compared against the credential itself.
+    fn ctx_as<'a>(subject: &'a str, scope: &'a str) -> RequestContext<'a> {
         RequestContext {
+            subject,
             audience: "patient-db",
             purpose: "triage",
             session_id: "sess-1",
             action_scope: scope,
         }
+    }
+
+    fn ctx<'a>(scope: &'a str) -> RequestContext<'a> {
+        ctx_as("agent-a", scope)
     }
 
     fn read_grant() -> Grant {
@@ -639,9 +734,10 @@ mod tests {
                 DAY_MS,
             )
             .unwrap();
+        // The child is bound to agent-b, so it must be presented as agent-b.
         let d = decide(
             &child,
-            &ctx("db.read"),
+            &ctx_as("agent-b", "db.read"),
             &read_grant(),
             &Capability::NONE,
             1_000,
@@ -654,8 +750,31 @@ mod tests {
         // But the child cannot obtain the write grant it delegated away.
         let mut wg = write_grant();
         wg.required_scope = "db.write".into();
-        let d2 = decide(&child, &ctx("db.write"), &wg, &Capability::NONE, 1_000, 30);
+        let d2 = decide(
+            &child,
+            &ctx_as("agent-b", "db.write"),
+            &wg,
+            &Capability::NONE,
+            1_000,
+            30,
+        );
         assert_eq!(d2, JitDecision::Deny("action scope not granted"));
+    }
+
+    #[test]
+    fn credential_subject_mismatch_is_denied() {
+        // read_cred was issued to agent-a; presenting it as agent-b is refused (bearer-token defense)
+        // before the grant is even consulted.
+        let kp = issuer();
+        let d = decide(
+            &read_cred(&kp),
+            &ctx_as("agent-b", "db.read"),
+            &read_grant(),
+            &Capability::NONE,
+            1_000,
+            60,
+        );
+        assert_eq!(d, JitDecision::Deny("subject mismatch"));
     }
 
     #[test]
@@ -720,16 +839,76 @@ mod tests {
             "R=[\"arn:a\",\"arn:b\"]"
         );
 
-        // No resources → wildcard.
+        // No resources → the fail-closed sentinel (matches nothing), NEVER a `*` wildcard.
         let none = Provider::Sts {
             role_arn: "arn:r".into(),
             resource_arns: vec![],
             session_policy_template: "R={resource}".into(),
         };
-        assert_eq!(none.rendered_session_policy().unwrap(), "R=*");
+        let rendered = none.rendered_session_policy().unwrap();
+        assert_eq!(rendered, format!("R={NO_RESOURCE_SENTINEL}"));
+        assert!(
+            !rendered.contains('*'),
+            "empty resources must not render a wildcard"
+        );
 
         // Secret provider has no session policy.
         assert!(write_grant().provider.rendered_session_policy().is_none());
+    }
+
+    #[test]
+    fn unix_to_iso8601_formats_utc() {
+        assert_eq!(unix_to_iso8601(0), "1970-01-01T00:00:00Z");
+        assert_eq!(unix_to_iso8601(1_700_000_000), "2023-11-14T22:13:20Z");
+        // A leap day.
+        assert_eq!(unix_to_iso8601(1_709_164_800), "2024-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn fence_appends_a_time_bounded_deny_and_keeps_the_allow() {
+        // Operator policy: allow reading one resource.
+        let rendered = r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":"rds-db:connect","Resource":"arn:aws:rds-db:us-east-1:111:dbuser/db/reader"}
+        ]}"#;
+        let fenced = fence_session_policy(rendered, 1_700_000_060);
+        let v: serde_json::Value = serde_json::from_str(&fenced).unwrap();
+        let stmts = v["Statement"].as_array().unwrap();
+        assert_eq!(stmts.len(), 2, "operator allow preserved + fence appended");
+        // The original Allow survives (narrowing still applies before expiry).
+        assert!(stmts.iter().any(|s| s["Effect"] == "Allow"
+            && s["Resource"] == "arn:aws:rds-db:us-east-1:111:dbuser/db/reader"));
+        // The fence is a Deny-* gated on the intended expiry.
+        let deny = stmts.iter().find(|s| s["Effect"] == "Deny").unwrap();
+        assert_eq!(deny["Action"], "*");
+        assert_eq!(deny["Resource"], "*");
+        assert_eq!(
+            deny["Condition"]["DateGreaterThan"]["aws:CurrentTime"],
+            "2023-11-14T22:14:20Z"
+        );
+    }
+
+    #[test]
+    fn fence_wraps_a_single_statement_object() {
+        // A policy whose Statement is a lone object (not an array) is normalized, not dropped.
+        let rendered = r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:x"}}"#;
+        let v: serde_json::Value =
+            serde_json::from_str(&fence_session_policy(rendered, 100)).unwrap();
+        let stmts = v["Statement"].as_array().unwrap();
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts.iter().any(|s| s["Effect"] == "Allow"));
+        assert!(stmts.iter().any(|s| s["Effect"] == "Deny"));
+    }
+
+    #[test]
+    fn fence_of_empty_or_garbage_is_deny_only_fail_closed() {
+        for src in ["", "   ", "not json", "[]", "42"] {
+            let v: serde_json::Value =
+                serde_json::from_str(&fence_session_policy(src, 100)).unwrap();
+            let stmts = v["Statement"].as_array().unwrap();
+            assert_eq!(stmts.len(), 1, "no operator Allow to preserve for {src:?}");
+            assert_eq!(stmts[0]["Effect"], "Deny", "fail-closed for {src:?}");
+            assert_eq!(v["Version"], "2012-10-17");
+        }
     }
 
     #[test]
@@ -759,6 +938,32 @@ mod tests {
         g.max_ttl_secs = 0;
         c.upsert(g);
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn sts_grant_without_resource_arns_is_rejected() {
+        // An STS grant that names no resource would render a wildcard session policy (un-narrowed
+        // role) → refuse it at validation.
+        let mut bad = read_grant();
+        bad.id = "bad-sts".into();
+        bad.provider = Provider::Sts {
+            role_arn: "arn:aws:iam::111122223333:role/x".into(),
+            resource_arns: vec![],
+            session_policy_template: "{}".into(),
+        };
+        let mut c = GrantCatalog::empty();
+        c.upsert(bad);
+        assert!(c.validate().is_err());
+
+        // A Secret grant needs no resource_arns — unaffected.
+        let mut ok = GrantCatalog::empty();
+        ok.upsert(write_grant());
+        assert!(ok.validate().is_ok());
+
+        // The same STS grant WITH a resource passes.
+        let mut good = GrantCatalog::empty();
+        good.upsert(read_grant());
+        assert!(good.validate().is_ok());
     }
 
     #[test]
