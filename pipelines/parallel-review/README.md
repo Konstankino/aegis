@@ -50,11 +50,33 @@ Agents B and C are **peers** — identical rights, isolated from each other and 
 | [`code/pipeline.py`](code/pipeline.py) | the pipeline's tool implementations |
 | [`asl/pipeline.asl.json`](asl/pipeline.asl.json) | the `Parallel` fan-out/fan-in state machine |
 
+## Run the Bedrock Converse tool-use loop locally
+
+[`run_local.py`](run_local.py) drives the fan-out/fan-in flow through the **Amazon Bedrock Converse
+API** tool-use loop: A dispatches, **B and C run concurrently** (two threads, one shared `thread_id`),
+then D referees. It reads the same source of truth as production (tools.json → `toolConfig`,
+broker.cedar → mediation, pipeline.json, code/pipeline.py).
+
+```bash
+# Offline scripted mock (no AWS); or --live for real Bedrock.
+python3 pipelines/parallel-review/run_local.py "he go to the stor yesterday"
+
+# Through the REAL Aegis gate — start it over THIS pipeline's policies, then drive it:
+AEGIS_GATE_ADDR=127.0.0.1:8786 AEGIS_POLICY_DIR="$PWD/pipelines/parallel-review/policies" \
+  cargo run -p aegis-extension          # (leave running)
+python3 pipelines/parallel-review/run_local.py --gate 127.0.0.1:8786 "he go to the stor yesterday"
+```
+
+With `--gate`, B and C mediate **concurrently on one shared `thread_id`**, so each of the four
+principals is authorised as itself from the real `broker.cedar` while the thread's Rule-of-Two taint
+accumulates — a good stress of the gate's multi-principal-per-thread path.
+
 ## Run / test (no AWS)
 
 ```bash
 aegis --dir pipelines/parallel-review/policies validate
 cd pipelines/parallel-review/code && python3 -m unittest test_pipeline   # plugin + consistency + engine E2E
+cd pipelines/parallel-review && python3 -m unittest test_run_local       # the Converse driver (mock)
 cargo test -p aegis-broker --test parallel_review                        # the broker acceptance gate
 ```
 

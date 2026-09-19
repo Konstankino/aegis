@@ -382,6 +382,12 @@ async fn mediate(
                 let session = sessions
                     .get_mut(&key)
                     .expect("session seeded by ensure_thread_loaded");
+                // A thread (conversation) is SHARED across a pipeline's principals — editorial's
+                // A/B/C all carry the same thread_id — so authorize THIS call as its CURRENT caller.
+                // The session keeps the thread's accumulated Rule-of-Two taint (never reset); only the
+                // principal label tracks the caller. Without this, a warm process pins authorization to
+                // whichever agent opened the thread and denies every later stage.
+                session.agent_id = req.agent_id.clone();
                 (st.broker.mediate(session, &call), session.cap)
             };
             match decision {
@@ -1522,6 +1528,30 @@ mod tests {
         Arc::new(Broker::from_sources(&tools, cedar).unwrap())
     }
 
+    /// A broker where agent-a may call ONLY `a.tool` and agent-b may call ONLY `b.tool`. Both tools
+    /// are benign (no Rule-of-Two legs), so a shared thread never forms a trifecta — isolating the
+    /// principal-authorization behaviour under test.
+    fn broker_two_agents_two_tools() -> Arc<Broker> {
+        let tools = serde_json::json!([
+            {"name": "a.tool", "reaches_sensitive_data": false, "has_external_effect": false,
+             "consequence": "low_reversible",
+             "schema": {"type": "object", "properties": {"x": {"type": "string"}},
+                        "required": ["x"], "additionalProperties": false}},
+            {"name": "b.tool", "reaches_sensitive_data": false, "has_external_effect": false,
+             "consequence": "low_reversible",
+             "schema": {"type": "object", "properties": {"x": {"type": "string"}},
+                        "required": ["x"], "additionalProperties": false}}
+        ])
+        .to_string();
+        let cedar = concat!(
+            "permit ( principal == Agent::\"agent-a\", action == Action::\"invoke\", ",
+            "resource == Tool::\"a.tool\" );\n",
+            "permit ( principal == Agent::\"agent-b\", action == Action::\"invoke\", ",
+            "resource == Tool::\"b.tool\" );",
+        );
+        Arc::new(Broker::from_sources(&tools, cedar).unwrap())
+    }
+
     fn app() -> Router {
         router(test_broker(), GateConfig::default())
     }
@@ -1627,10 +1657,90 @@ mod tests {
     }
 
     fn call(thread: &str, tool: &str, args: serde_json::Value, prov: &str) -> serde_json::Value {
+        call_as("a", thread, tool, args, prov)
+    }
+
+    fn call_as(
+        agent: &str,
+        thread: &str,
+        tool: &str,
+        args: serde_json::Value,
+        prov: &str,
+    ) -> serde_json::Value {
         serde_json::json!({
-            "agent_id": "a", "run_id": "r", "thread_id": thread,
+            "agent_id": agent, "run_id": "r", "thread_id": thread,
             "tool": tool, "args": args, "arg_provenance": prov
         })
+    }
+
+    #[tokio::test]
+    async fn a_shared_thread_authorizes_each_caller_not_just_the_first() {
+        // A pipeline's principals (A, B, …) all share one thread_id. The gate must authorize each
+        // /mediate call as ITS caller, not pin the principal to whichever agent opened the thread.
+        let app = router(broker_two_agents_two_tools(), GateConfig::default());
+        let t = "t-shared";
+
+        // agent-a opens the thread with its own tool -> allowed (seeds the in-memory session).
+        let (_s, a) = post(
+            app.clone(),
+            "/mediate",
+            call_as(
+                "agent-a",
+                t,
+                "a.tool",
+                serde_json::json!({"x": "1"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(a["decision"], "allow");
+
+        // agent-b, SAME thread, calls ITS tool. Must be authorized as agent-b (allow) — the
+        // regression: before the fix the session was pinned to agent-a (who lacks b.tool) → deny.
+        let (_s, b) = post(
+            app.clone(),
+            "/mediate",
+            call_as(
+                "agent-b",
+                t,
+                "b.tool",
+                serde_json::json!({"x": "2"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(
+            b["decision"], "allow",
+            "agent-b must be authorized as itself on a shared thread, not as agent-a"
+        );
+
+        // And each principal still cannot reach the OTHER's tool on that same thread.
+        let (_s, a_bad) = post(
+            app.clone(),
+            "/mediate",
+            call_as(
+                "agent-a",
+                t,
+                "b.tool",
+                serde_json::json!({"x": "3"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(a_bad["decision"], "deny");
+        let (_s, b_bad) = post(
+            app.clone(),
+            "/mediate",
+            call_as(
+                "agent-b",
+                t,
+                "a.tool",
+                serde_json::json!({"x": "4"}),
+                "user",
+            ),
+        )
+        .await;
+        assert_eq!(b_bad["decision"], "deny");
     }
 
     #[tokio::test]
