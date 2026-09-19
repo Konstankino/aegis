@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # Keep the SHA-pinned GitHub Actions in .github/workflows/** current: Dependabot opens PRs that
+  # bump both the pinned commit SHA and its version comment, so pinning never means going stale.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+    groups:
+      # One PR per week for all action bumps instead of one PR per action.
+      actions:
+        patterns:
+          - "*"
