@@ -60,11 +60,36 @@ class ConsistencyTest(unittest.TestCase):
                 self.assertIn(name, self.tool_names, f"{name} missing from tools.json")
             self.assertIn(stage["terminal"]["tool"], self.tool_names)
 
-    def test_every_manifest_tool_is_implemented_by_the_plugin(self):
+    # Platform tools are cross-cutting capabilities of the guardrail plane, implemented by the ENGINE
+    # (agent.py), not by a pipeline plugin — the plugin returns None for them so the engine takes over.
+    PLATFORM_TOOLS = {"source.read", "web.fetch", "code.run", "log.write"}
+
+    def test_every_manifest_tool_is_implemented_by_the_plugin_or_is_a_platform_tool(self):
         for stage in self.manifest["stages"]:
             for entry in stage["tools"]:
                 name = entry["name"] if isinstance(entry, dict) else entry
-                self.assertIsNotNone(pipeline.run_tool(name, {}), f"{name} not implemented in pipeline.py")
+                if name in self.PLATFORM_TOOLS:
+                    # Engine-provided: the plugin must NOT own it (falls through to the platform).
+                    self.assertIsNone(pipeline.run_tool(name, {}),
+                                      f"{name} is a platform tool; the plugin must not implement it")
+                else:
+                    self.assertIsNotNone(pipeline.run_tool(name, {}),
+                                         f"{name} not implemented in pipeline.py")
+
+    def test_ingest_stage_reads_the_source_with_a_platform_tool(self):
+        # The optional first stage fetches the dropped file; it is a distinct principal that may use
+        # ONLY source.read, and its terminal draws the stage output from the tool RESULT (the fetched
+        # text), not the call args — so the document is not rewritten by the model.
+        ingest = next((s for s in self.manifest["stages"] if s["agent_id"] == "agent-ingest"), None)
+        self.assertIsNotNone(ingest, "manifest must define the agent-ingest stage")
+        self.assertEqual([t["name"] for t in ingest["tools"]], ["source.read"])
+        self.assertEqual(ingest["terminal"],
+                         {"tool": "source.read", "output_key": "output", "arg_key": "text", "from": "result"})
+        # S3-ingestion-only: the ingest stage is the sole entry (StartAt), and hands off into A->B->C.
+        self.assertEqual(self.asl["StartAt"], "Ingest")
+        self.assertEqual(self.asl["States"]["Ingest"]["Next"], "AgentA_Grammar")
+        self.assertNotIn("Route", self.asl["States"])   # no HTTP router
+        self.assertNotIn("SeedText", self.asl["States"])
 
     def test_manifest_principals_match_cedar_and_asl(self):
         agent_ids = [s["agent_id"] for s in self.manifest["stages"]]

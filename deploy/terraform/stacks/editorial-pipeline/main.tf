@@ -12,6 +12,9 @@ locals {
       pipeline_dir  = abspath("${path.module}/../../../../pipelines/editorial")
       pipeline_name = "editorial"
       model_id      = null
+      # The editorial pipeline is S3-ingestion-only: no HTTP /chat entry. Configure source_bucket
+      # (below or via var.pipelines) to give it a trigger.
+      enable_http_entry = false
     }
   }
 }
@@ -48,6 +51,17 @@ module "pipeline" {
   pipeline_dir     = each.value.pipeline_dir
   asl_dir          = "${each.value.pipeline_dir}/asl"
   policy_dir       = "${each.value.pipeline_dir}/policies"
+
+  # HTTP front door (POST /chat). The editorial fallback sets this false (S3-only); other pipelines
+  # default to true. `try` covers map entries that omit the key.
+  enable_http_entry = try(each.value.enable_http_entry, true)
+
+  # Optional S3 file-drop ingestion (per-pipeline; empty source_bucket = feature off). `try` lets the
+  # built-in fallback pipeline (which omits these keys) default cleanly to "off".
+  source_bucket                      = try(each.value.source_bucket, "")
+  source_prefix                      = try(each.value.source_prefix, "incoming/")
+  source_kms_key_arn                 = try(each.value.source_kms_key_arn, "")
+  manage_source_bucket_notifications = try(each.value.manage_source_bucket_notifications, true)
 
   # Optional shared VPC + OTel.
   vpc_subnet_ids            = module.shared.vpc_subnet_ids

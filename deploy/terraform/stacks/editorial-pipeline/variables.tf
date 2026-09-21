@@ -37,6 +37,15 @@ variable "pipelines" {
     pipeline_dir  = string
     pipeline_name = optional(string)
     model_id      = optional(string)
+    # HTTP front door (POST /chat, GET /status). Default on; set false for an event-driven-only
+    # pipeline (the editorial pipeline is S3-ingestion-only and defaults this off below).
+    enable_http_entry = optional(bool, true)
+    # Optional S3 file-drop ingestion: watch an existing bucket for *.txt and read each with a
+    # short-lived, object-scoped JIT credential. Omit source_bucket to leave the feature off.
+    source_bucket                      = optional(string, "")
+    source_prefix                      = optional(string, "incoming/")
+    source_kms_key_arn                 = optional(string, "")
+    manage_source_bucket_notifications = optional(bool, true)
   }))
   default = {}
 }

@@ -332,11 +332,24 @@ def run_editorial(client, text, plane=None):
     return c["output"], {"a": a, "b": b, "c": c}, trace
 
 
+def run_from_file(client, path, plane=None):
+    """Offline convenience: read a local *.txt (standing in for the dropped S3 object) and run it
+    through A -> B -> C. The DEPLOYED pipeline instead has a dedicated agent-ingest stage fetch the
+    object with a short-lived, object-scoped JIT credential (/credentials/issue); that AWS path can't
+    run offline, so here we read the file directly and feed its text into the chain."""
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    return run_editorial(client, text, plane)
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────────────────────────────
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Bedrock Converse tool use for the editorial pipeline.")
     ap.add_argument("text", nargs="?", default="he go to the stor yesterday",
                     help="the raw text to run through A -> B -> C")
+    ap.add_argument("--from-file", metavar="PATH", default=None,
+                    help="read the input text from a local *.txt file (offline stand-in for the S3 "
+                         "file-drop the deployed agent-ingest stage fetches via a JIT credential)")
     ap.add_argument("--live", action="store_true", help="call real Bedrock (needs AWS + model access)")
     ap.add_argument("--model", default=DEFAULT_MODEL, help="Bedrock model id (with --live)")
     ap.add_argument("--region", default=os.environ.get("AWS_REGION", "us-east-1"))
@@ -350,7 +363,10 @@ def main(argv=None):
     print("model: %s\nplane: %s\n"
           % (args.model if args.live else "MockConverse (offline)", plane.kind))
 
-    final, stages, trace = run_editorial(client, args.text, plane)
+    if args.from_file:
+        final, stages, trace = run_from_file(client, args.from_file, plane)
+    else:
+        final, stages, trace = run_editorial(client, args.text, plane)
 
     print("=== mediated tool calls (%s) ===" % ("Aegis gate" if args.gate else "broker.cedar"))
     for agent, tool, verdict, reason in trace:

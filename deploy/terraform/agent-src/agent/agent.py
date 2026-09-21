@@ -44,6 +44,12 @@ TABLE = os.environ.get("AEGIS_CHECKPOINT_TABLE")
 # The isolated code-runner Lambda (ASI05). Empty = code execution is disabled for this agent.
 RUNNER_FUNCTION = os.environ.get("AEGIS_RUNNER_FUNCTION")
 MAX_TURNS = int(os.environ.get("AEGIS_MAX_TURNS", "12"))
+# S3 file-drop ingestion (principal agent-ingest): the JIT grant its identity credential is exchanged
+# for, to mint a short-lived, object-scoped S3 read credential. audience/scope must match the grant in
+# the pipeline's grants.toml (`editorial-source-read`); a deployment can override via env.
+SOURCE_GRANT_ID = os.environ.get("AEGIS_SOURCE_GRANT_ID", "editorial-source-read")
+SOURCE_AUDIENCE = os.environ.get("AEGIS_SOURCE_AUDIENCE", "editorial-source")
+SOURCE_SCOPE = os.environ.get("AEGIS_SOURCE_SCOPE", "s3.read")
 # Where the bundle (tools.json / pipeline.json / pipeline.py) sits — the Lambda task root by default.
 BUNDLE_DIR = os.environ.get("AEGIS_BUNDLE_DIR", os.path.dirname(os.path.abspath(__file__)))
 # System prompt for the generic single-agent profile (used only when there is no pipeline manifest).
@@ -116,7 +122,13 @@ def _profile_from_tools(system, tool_entries, schemas, terminal_spec):
         name_map[converse_name(fq)] = fq
     terminal = {}
     if terminal_spec:
-        terminal = {terminal_spec["tool"]: (terminal_spec["output_key"], terminal_spec["arg_key"])}
+        # `from` selects where the handoff payload comes from: "args" (default) = the tool CALL args;
+        # "result" = the tool RESULT (so a fetched document flows out verbatim, not model-rewritten).
+        terminal = {terminal_spec["tool"]: (
+            terminal_spec["output_key"],
+            terminal_spec["arg_key"],
+            terminal_spec.get("from", "args"),
+        )}
     return {"system": system, "tools": tools, "name_map": name_map, "terminal": terminal}
 
 
@@ -284,6 +296,9 @@ def run_tool(fq_tool, args, agent_id="", thread_id=""):
         if result is not None:
             return result
 
+    if fq_tool == "source.read":
+        return read_source(args.get("bucket", ""), args.get("key", ""), agent_id, thread_id,
+                           args.get("version_id", ""), args.get("etag", ""))
     if fq_tool == "web.fetch":
         # Route every outbound URL through the egress allowlist first.
         status, body = _gate_get("/decide?url=" + urllib.parse.quote(args.get("url", ""), safe=""))
@@ -301,6 +316,61 @@ def run_tool(fq_tool, args, agent_id="", thread_id=""):
                           "message": clean, "redactions": n}))
         return {"logged": True, "redactions": n}
     return {"error": f"no implementation for {fq_tool}"}
+
+
+def read_source(bucket, key, agent_id="", thread_id="", version_id="", etag=""):
+    """Fetch an S3 text object with a SHORT-LIVED, object-scoped credential minted by the JIT broker —
+    never the standing execution role (ASI03/ASI06). Two loopback hops: `/identity/self` signs a
+    per-run identity credential for this principal (the private key stays inside the co-located
+    extension), then `/credentials/issue` exchanges it — via the deterministic `aegis-jit` decision —
+    for a ≤5-minute STS session whose inline policy is scoped to exactly this object. Fail-closed: any
+    failure returns an error and reads nothing.
+
+    The bucket/key are the authoritative coordinates from the S3 event; the grant's key-prefix scope
+    and the minted session policy bound them, so a key outside the granted prefix is refused by AWS.
+
+    TOCTOU: the object at `key` may be overwritten between the event and this read. `version_id` (from
+    the event, when the bucket is versioned) pins the read to the EXACT version that triggered the run;
+    otherwise `etag` is enforced with a conditional read (`IfMatch`) so a changed object fails closed
+    (412) rather than being processed silently."""
+    if not bucket or not key:
+        return {"error": "source.read requires bucket and key"}
+    # 1) Sign a short-lived identity credential for this principal (loopback; extension holds the key).
+    status, cred = _gate_post("/identity/self", {
+        "agent_id": agent_id, "audience": SOURCE_AUDIENCE, "scopes": [SOURCE_SCOPE],
+        "session_id": thread_id, "ttl_secs": 300,
+    })
+    if status != 200 or "credential" not in cred:
+        return {"error": f"identity issue failed: {cred.get('error', status)}"}
+    # 2) Exchange it for a real, object-scoped, short-lived cloud credential (the JIT broker decides).
+    status, body = _gate_post("/credentials/issue", {
+        "agent_id": agent_id, "run_id": "", "thread_id": thread_id,
+        "credential": cred["credential"], "grant_id": SOURCE_GRANT_ID,
+        "requested_ttl_secs": 300, "action_scope": SOURCE_SCOPE,
+    })
+    if status != 200 or body.get("decision") != "grant":
+        return {"error": f"credential denied: {body.get('reason') or body.get('decision') or status}"}
+    creds = body.get("credential") or {}
+    # 3) Read the object with the minted short-lived session — object-scoped, expires in minutes.
+    try:
+        s3 = boto3.client(
+            "s3",
+            aws_access_key_id=creds.get("access_key_id"),
+            aws_secret_access_key=creds.get("secret_access_key"),
+            aws_session_token=creds.get("session_token"),
+        )
+        # Pin to the exact object the event referred to (version pin preferred; else a conditional
+        # read on the etag that fails closed if the object changed since the event).
+        pin = {}
+        if version_id:
+            pin["VersionId"] = version_id
+        elif etag:
+            pin["IfMatch"] = etag
+        obj = s3.get_object(Bucket=bucket, Key=key, **pin)
+        text = obj["Body"].read().decode("utf-8", "replace")
+    except Exception as e:  # noqa: BLE001 — surface any read failure to the model as a tool error
+        return {"error": f"s3 get_object failed: {e}"}
+    return {"text": text}
 
 
 def run_code(code, agent_id="", thread_id=""):
@@ -359,6 +429,13 @@ def estimate_tokens(messages):
 def seed_input(event):
     """Turn the stage input into the first user message. A referee stage receives `candidates`
     (a list) rather than a single `input` text."""
+    if event.get("source_key") is not None:
+        # File-drop intake (agent-ingest): point the principal at the dropped object so it calls
+        # source_read to load it. The coordinates are authoritative (from the S3 event).
+        bucket, key = event.get("source_bucket", ""), event["source_key"]
+        return {"role": "user", "content": [{"text":
+            f"A text document was placed in object storage at bucket '{bucket}', key '{key}'. "
+            f"Call source_read with exactly that bucket and key to load its text. Do nothing else."}]}
     if event.get("input") is not None:
         return {"role": "user", "content": [{"text": event["input"]}]}
     if event.get("candidates") is not None:
@@ -419,6 +496,19 @@ def handler(event, context):
 
         fq = profile["name_map"].get(tool_use["name"], tool_use["name"])
 
+        # File-drop intake is authoritative from the S3 EVENT, not the model: overwrite the
+        # source.read args with the coordinates + version/etag the ASL passed in, BEFORE mediation.
+        # This closes the TOCTOU window (pin the exact version) and neutralises a tampered/stale tool
+        # call; because the event carries it on every (re)invocation, a cold-start re-applies the pin,
+        # and the value is persisted into `pending` so a HITL resume reads the same version.
+        if fq == "source.read" and event.get("source_key"):
+            tool_use["input"] = {
+                "bucket": event.get("source_bucket", ""),
+                "key": event["source_key"],
+                "version_id": event.get("source_version_id", ""),
+                "etag": event.get("source_etag", ""),
+            }
+
         # 4) Mediate the proposed tool call through Aegis as this principal.
         decision = mediate(agent_id, thread_id, run_id, fq, tool_use["input"])
         verdict = decision.get("decision")
@@ -442,10 +532,14 @@ def handler(event, context):
         # machine's ResultSelector ({output: ...} or {candidates: [...]}).
         terminal = profile["terminal"].get(fq)
         if terminal:
-            result_key, arg_key = terminal
+            result_key, arg_key, source = terminal
+            # The payload is normally the tool CALL args; `from: "result"` takes it from the tool
+            # RESULT instead (e.g. a fetched document), so the model can't rewrite it in the handoff.
+            raw = (result if isinstance(result, dict) else {}).get(arg_key) \
+                if source == "result" else tool_use["input"].get(arg_key)
             # Scan the handoff BEFORE it moves to the next stage — a compromised agent must not pass
             # leaked/unsafe content down the chain.
-            payload = guarded_output(thread_id, tool_use["input"].get(arg_key))
+            payload = guarded_output(thread_id, raw)
             save_messages(thread_id, messages)
             return {"status": "done", result_key: payload, "thread_id": thread_id}
 

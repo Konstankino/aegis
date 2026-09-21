@@ -1,7 +1,16 @@
 {
   "name": "editorial",
-  "description": "A three-agent editorial chain A -> B -> C: grammar correction, fact enrichment, then a referee that publishes the chosen version. Each agent is a Cedar principal on the one shared agent Lambda.",
+  "description": "A three-agent editorial chain A -> B -> C: grammar correction, fact enrichment, then a referee that publishes the chosen version. Each agent is a Cedar principal on the one shared agent Lambda. An optional agent-ingest stage fetches a dropped *.txt from S3 with a short-lived, object-scoped credential (JIT) and feeds its text into A.",
   "stages": [
+    {
+      "agent_id": "agent-ingest",
+      "state": "Ingest",
+      "system": "A text document was placed in object storage. Load it by calling source_read with exactly the bucket and key you are given. Do nothing else.",
+      "tools": [
+        { "name": "source.read", "description": "Read the dropped text object from S3 using a short-lived, object-scoped credential." }
+      ],
+      "terminal": { "tool": "source.read", "output_key": "output", "arg_key": "text", "from": "result" }
+    },
     {
       "agent_id": "agent-a",
       "state": "AgentA_Grammar",

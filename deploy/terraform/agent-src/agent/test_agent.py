@@ -218,5 +218,253 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(out["output"], agent.SAFE_BLOCK)
 
 
+class TerminalFromResultTest(unittest.TestCase):
+    """A terminal handoff with `"from": "result"` takes the stage output from the tool's RESULT, not
+    its call args — so a fetched document flows out verbatim without the model rewriting it."""
+
+    TOOLS = [{"name": "src.read",
+              "schema": {"type": "object",
+                         "properties": {"bucket": {"type": "string"}, "key": {"type": "string"}},
+                         "required": ["bucket", "key"], "additionalProperties": False}}]
+    MANIFEST = {"name": "fx", "stages": [
+        {"agent_id": "p-i", "state": "I", "system": "load it",
+         "tools": [{"name": "src.read"}],
+         "terminal": {"tool": "src.read", "output_key": "output", "arg_key": "text", "from": "result"}}]}
+    PLUGIN = ("def run_tool(fq, args, agent_id='', thread_id=''):\n"
+              "    if fq == 'src.read':\n"
+              "        return {'text': 'FILE CONTENT'}\n"
+              "    return None\n")
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        _write_bundle(self._tmp.name, tools=self.TOOLS, manifest=self.MANIFEST, plugin=self.PLUGIN)
+        agent.reload_bundle(self._tmp.name)
+        self._orig = (agent.bedrock, agent.mediate, agent._wait_for_gate, agent.preflight,
+                      agent.save_messages, agent.load_messages, agent.scan_output)
+        agent.bedrock = type("M", (), {"converse": staticmethod(
+            lambda **_k: _tool_use("src_read", {"bucket": "b", "key": "incoming/x.txt"}))})()
+        agent.mediate = lambda *a, **k: {"decision": "allow"}
+        agent._wait_for_gate = lambda *a, **k: True
+        agent.preflight = lambda *a, **k: {"decision": "allow"}
+        agent.save_messages = lambda *a, **k: None
+        agent.load_messages = lambda *a, **k: None
+        agent.scan_output = lambda *a, **k: True
+
+    def tearDown(self):
+        (agent.bedrock, agent.mediate, agent._wait_for_gate, agent.preflight,
+         agent.save_messages, agent.load_messages, agent.scan_output) = self._orig
+        agent.reload_bundle(EngineTest._tmp.name)
+        self._tmp.cleanup()
+
+    def test_output_comes_from_the_tool_result(self):
+        out = agent.handler({"agent_id": "p-i", "thread_id": "t",
+                             "source_bucket": "b", "source_key": "incoming/x.txt"}, None)
+        self.assertEqual(out, {"status": "done", "output": "FILE CONTENT", "thread_id": "t"})
+
+
+class SourceReadTest(unittest.TestCase):
+    """`source.read` fetches an S3 object with a SHORT-LIVED, object-scoped credential minted by the
+    JIT broker: /identity/self (sign) -> /credentials/issue (exchange) -> GetObject. Fail-closed."""
+
+    def setUp(self):
+        self.posts = []
+        self._orig_post = agent._gate_post
+        self._orig_boto = agent.boto3
+
+        def fake_post(path, body):
+            self.posts.append((path, body))
+            if path == "/identity/self":
+                if getattr(self, "identity_fail", False):
+                    return 503, {"error": "unavailable"}
+                return 200, {"credential": {"subject": body["agent_id"], "sig": "x"}}
+            if path == "/credentials/issue":
+                if getattr(self, "deny", False):
+                    return 403, {"decision": "deny", "reason": "policy denies this"}
+                return 200, {"decision": "grant", "credential": {
+                    "kind": "sts", "access_key_id": "AK", "secret_access_key": "SK",
+                    "session_token": "TOK", "expires_at_ms": 1}}
+            return 200, {}
+
+        class _Body:
+            def __init__(self, data): self._d = data
+            def read(self): return self._d
+
+        class _S3:
+            def __init__(self, outer, **kw): self.kw = kw; outer.s3_kwargs = kw
+            def get_object(self_inner, Bucket, Key, **kw):
+                self.get_calls.append((Bucket, Key))
+                self.get_kwargs = kw
+                if getattr(self, "s3_raise", False):
+                    raise RuntimeError("AccessDenied")
+                return {"Body": _Body(b"hello from s3")}
+
+        self.get_calls = []
+        self.s3_kwargs = None
+        agent._gate_post = fake_post
+        agent.boto3 = types.SimpleNamespace(client=lambda svc, **kw: _S3(self, **kw))
+
+    def tearDown(self):
+        agent._gate_post = self._orig_post
+        agent.boto3 = self._orig_boto
+
+    def test_mints_short_lived_creds_then_reads(self):
+        out = agent.run_tool("source.read", {"bucket": "b", "key": "incoming/x.txt"},
+                             "agent-ingest", "thread-1")
+        self.assertEqual(out, {"text": "hello from s3"})
+        paths = [p for p, _ in self.posts]
+        self.assertEqual(paths, ["/identity/self", "/credentials/issue"])
+        # The exchange presents the signed credential and names the editorial source grant + scope.
+        issue_body = dict(self.posts[1][1])
+        self.assertIn("credential", issue_body)
+        self.assertTrue(issue_body["grant_id"])         # a concrete grant id, not empty
+        self.assertLessEqual(issue_body["requested_ttl_secs"], 300)
+        # The object is read with the MINTED short-lived session, never a standing role.
+        self.assertEqual(self.s3_kwargs["aws_access_key_id"], "AK")
+        self.assertEqual(self.s3_kwargs["aws_session_token"], "TOK")
+        self.assertEqual(self.get_calls, [("b", "incoming/x.txt")])
+
+    def test_fail_closed_when_credential_denied(self):
+        self.deny = True
+        out = agent.run_tool("source.read", {"bucket": "b", "key": "incoming/x.txt"},
+                             "agent-ingest", "thread-1")
+        self.assertIn("error", out)
+        self.assertEqual(self.get_calls, [])  # denied -> NO object read
+
+    def test_missing_bucket_or_key_is_rejected_before_any_call(self):
+        out = agent.run_tool("source.read", {"bucket": "b"}, "agent-ingest", "t")
+        self.assertIn("error", out)
+        self.assertEqual(self.posts, [])  # no identity/credential hops for a malformed request
+
+    def test_fail_closed_when_identity_issue_fails(self):
+        self.identity_fail = True
+        out = agent.run_tool("source.read", {"bucket": "b", "key": "incoming/x.txt"},
+                             "agent-ingest", "t")
+        self.assertIn("error", out)
+        self.assertEqual([p for p, _ in self.posts], ["/identity/self"])  # stopped before exchange
+        self.assertEqual(self.get_calls, [])
+
+    def test_s3_read_error_is_surfaced(self):
+        self.s3_raise = True
+        out = agent.run_tool("source.read", {"bucket": "b", "key": "incoming/x.txt"},
+                             "agent-ingest", "t")
+        self.assertIn("error", out)
+        self.assertIn("get_object", out["error"])
+
+    # ── TOCTOU: pin the read to the exact object version/etag from the event ─────────────────────
+    def test_pins_to_version_id(self):
+        agent.run_tool("source.read",
+                       {"bucket": "b", "key": "incoming/x.txt", "version_id": "V3"},
+                       "agent-ingest", "t")
+        self.assertEqual(self.get_kwargs, {"VersionId": "V3"})  # exact version, not "latest"
+
+    def test_uses_ifmatch_when_only_etag(self):
+        agent.run_tool("source.read",
+                       {"bucket": "b", "key": "incoming/x.txt", "etag": "E1"},
+                       "agent-ingest", "t")
+        self.assertEqual(self.get_kwargs, {"IfMatch": "E1"})  # 412 if overwritten -> fail closed
+
+    def test_version_id_preferred_over_etag(self):
+        agent.run_tool("source.read",
+                       {"bucket": "b", "key": "incoming/x.txt", "version_id": "V3", "etag": "E1"},
+                       "agent-ingest", "t")
+        self.assertEqual(self.get_kwargs, {"VersionId": "V3"})
+
+    def test_no_pin_reads_current_object(self):
+        agent.run_tool("source.read", {"bucket": "b", "key": "incoming/x.txt"}, "agent-ingest", "t")
+        self.assertEqual(self.get_kwargs, {})  # unversioned bucket, no etag: plain read
+
+
+class IngestAuthoritativeSourceTest(unittest.TestCase):
+    """TOCTOU + tamper defence: the bucket/key/version/etag the ingest stage reads are taken from the
+    S3 event (via the ASL), NOT from the model's tool call. The handler overwrites the source.read
+    args before mediation, so a tampered or stale model call can't change which object/version is read,
+    and every (cold) re-invocation re-applies the same authoritative pin from the event."""
+
+    TOOLS = [{"name": "source.read",
+              "schema": {"type": "object",
+                         "properties": {"bucket": {"type": "string"}, "key": {"type": "string"},
+                                        "version_id": {"type": "string"}, "etag": {"type": "string"}},
+                         "required": ["bucket", "key"], "additionalProperties": False}}]
+    MANIFEST = {"name": "fx", "stages": [
+        {"agent_id": "agent-ingest", "state": "Ingest", "system": "load it",
+         "tools": [{"name": "source.read"}],
+         "terminal": {"tool": "source.read", "output_key": "output", "arg_key": "text", "from": "result"}}]}
+    PLUGIN = "def run_tool(fq, args, agent_id='', thread_id=''):\n    return None\n"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        _write_bundle(self._tmp.name, tools=self.TOOLS, manifest=self.MANIFEST, plugin=self.PLUGIN)
+        agent.reload_bundle(self._tmp.name)
+        self.mediated = []
+        self.get_calls = []
+
+        # The model tries to read a DIFFERENT object and an OLD version — this must be ignored.
+        tampered = {"bucket": "attacker", "key": "secret.txt", "version_id": "OLD"}
+        self._orig = (agent.bedrock, agent.mediate, agent._wait_for_gate, agent.preflight,
+                      agent.save_messages, agent.load_messages, agent.scan_output,
+                      agent._gate_post, agent.boto3)
+        agent.bedrock = type("M", (), {"converse": staticmethod(
+            lambda **_k: _tool_use("source_read", tampered))})()
+
+        def fake_mediate(agent_id, thread_id, run_id, fq, args):
+            self.mediated.append((fq, dict(args)))
+            return {"decision": "allow"}
+
+        agent.mediate = fake_mediate
+        agent._wait_for_gate = lambda *a, **k: True
+        agent.preflight = lambda *a, **k: {"decision": "allow"}
+        agent.save_messages = lambda *a, **k: None
+        agent.load_messages = lambda *a, **k: None
+        agent.scan_output = lambda *a, **k: True
+
+        def fake_post(path, body):
+            if path == "/identity/self":
+                return 200, {"credential": {"x": 1}}
+            if path == "/credentials/issue":
+                return 200, {"decision": "grant", "credential": {
+                    "access_key_id": "AK", "secret_access_key": "SK", "session_token": "TOK"}}
+            return 200, {}
+
+        outer = self
+
+        class _S3:
+            def get_object(self_inner, Bucket, Key, **kw):
+                outer.get_calls.append((Bucket, Key, kw))
+                return {"Body": type("B", (), {"read": staticmethod(lambda: b"authoritative text")})()}
+
+        agent._gate_post = fake_post
+        agent.boto3 = types.SimpleNamespace(client=lambda *a, **k: _S3())
+
+    def tearDown(self):
+        (agent.bedrock, agent.mediate, agent._wait_for_gate, agent.preflight,
+         agent.save_messages, agent.load_messages, agent.scan_output,
+         agent._gate_post, agent.boto3) = self._orig
+        agent.reload_bundle(EngineTest._tmp.name)
+        self._tmp.cleanup()
+
+    def test_event_source_overrides_a_tampered_model_call(self):
+        out = agent.handler({
+            "agent_id": "agent-ingest", "thread_id": "t",
+            "source_bucket": "trusted-bucket", "source_key": "incoming/x.txt",
+            "source_version_id": "V-EVENT", "source_etag": "E-EVENT",
+        }, None)
+        # Mediation saw the AUTHORITATIVE args from the event, never the tampered ones.
+        self.assertEqual(self.mediated, [("source.read",
+                         {"bucket": "trusted-bucket", "key": "incoming/x.txt",
+                          "version_id": "V-EVENT", "etag": "E-EVENT"})])
+        # The object read is pinned to the event's bucket/key/version — TOCTOU window closed.
+        self.assertEqual(self.get_calls, [("trusted-bucket", "incoming/x.txt", {"VersionId": "V-EVENT"})])
+        self.assertEqual(out, {"status": "done", "output": "authoritative text", "thread_id": "t"})
+
+
+class SeedSourceTest(unittest.TestCase):
+    def test_seed_input_names_the_s3_coordinates(self):
+        msg = agent.seed_input({"source_bucket": "b", "source_key": "incoming/x.txt"})
+        self.assertEqual(msg["role"], "user")
+        text = "".join(c.get("text", "") for c in msg["content"])
+        self.assertIn("b", text)
+        self.assertIn("incoming/x.txt", text)
+
+
 if __name__ == "__main__":
     unittest.main()

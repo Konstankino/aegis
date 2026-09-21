@@ -78,6 +78,47 @@ fn each_agent_may_call_only_its_own_lane() {
 }
 
 #[test]
+fn ingest_principal_may_only_read_the_source() {
+    // agent-ingest exists solely to fetch the dropped *.txt with a short-lived, object-scoped
+    // credential; it may invoke source.read and NOTHING else.
+    assert!(allows(
+        "agent-ingest",
+        "source.read",
+        json!({"bucket": "b", "key": "incoming/x.txt"})
+    ));
+    // The version/etag pin (TOCTOU) is part of the schema and passes mediation.
+    assert!(allows(
+        "agent-ingest",
+        "source.read",
+        json!({"bucket": "b", "key": "incoming/x.txt", "version_id": "v3", "etag": "e1"})
+    ));
+    for (tool, args) in [
+        ("grammar.correct", json!({"text": "x"})),
+        ("send.to_agent_b", json!({"text": "x"})),
+        ("enrich.add_facts", json!({"text": "x"})),
+        ("send.to_agent_c", json!({"candidates": ["x"]})),
+        ("referee.select", json!({"candidates": ["x"]})),
+        ("publish.final", json!({"text": "x"})),
+    ] {
+        assert!(
+            !allows("agent-ingest", tool, args),
+            "agent-ingest must not be able to call {tool}"
+        );
+    }
+    // Conversely, no editorial agent may read the source — only the ingest principal can.
+    for agent in ["agent-a", "agent-b", "agent-c"] {
+        assert!(
+            !allows(
+                agent,
+                "source.read",
+                json!({"bucket": "b", "key": "incoming/x.txt"})
+            ),
+            "{agent} must not be able to read the S3 source"
+        );
+    }
+}
+
+#[test]
 fn a_cannot_skip_the_chain_and_go_straight_to_c() {
     // The chain is enforced by which handoff each agent holds: A has only send.to_agent_b.
     assert!(!allows(
@@ -122,7 +163,8 @@ fn asl_orchestration_is_a_linear_a_b_c_chain_over_one_lambda() {
     // The deployable Step Functions definition parses (the `${agent_lambda_arn}` placeholders are
     // valid JSON strings) and encodes the same A -> B -> C order as the policy.
     let d: Value = serde_json::from_str(ASL).expect("editorial ASL is valid JSON");
-    assert_eq!(d["StartAt"], "Init");
+    // S3-ingestion-only: the run starts at the agent-ingest stage (there is no HTTP seed path).
+    assert_eq!(d["StartAt"], "Ingest");
     let states = &d["States"];
 
     // Three agent stages, in order, each invoking the SAME agent Lambda with a distinct agent_id —
@@ -151,6 +193,34 @@ fn asl_orchestration_is_a_linear_a_b_c_chain_over_one_lambda() {
     // Terminal shape.
     assert_eq!(states["Respond"]["End"], true);
     assert_eq!(states["Failed"]["Type"], "Fail");
+}
+
+#[test]
+fn asl_entry_is_s3_ingestion_only() {
+    // The pipeline's ONLY entry is the S3 file-drop: the state machine starts at the agent-ingest
+    // stage, which fetches the dropped object and hands its text into AgentA. There is no HTTP seed
+    // path (no Init/Route/SeedText states) — a run is started only by the EventBridge trigger.
+    let d: Value = serde_json::from_str(ASL).expect("editorial ASL is valid JSON");
+    let states = &d["States"];
+    assert_eq!(d["StartAt"], "Ingest", "the run starts at the ingest stage");
+    let ingest = &states["Ingest"];
+    assert_eq!(ingest["Type"], "Task", "Ingest is a Task");
+    assert_eq!(
+        ingest["Parameters"]["FunctionName"], "${agent_lambda_arn}",
+        "Ingest invokes the one shared agent function"
+    );
+    assert_eq!(
+        ingest["Parameters"]["Payload"]["agent_id"], "agent-ingest",
+        "Ingest runs as principal agent-ingest"
+    );
+    assert_eq!(
+        ingest["Next"], "AgentA_Grammar",
+        "Ingest hands off into the A->B->C chain"
+    );
+    // No leftover HTTP-entry states.
+    assert!(states["Route"].is_null() && states["SeedText"].is_null() && states["Init"].is_null());
+    // The ingest principal is governed by the same least-privilege policy set.
+    assert!(CEDAR.contains("agent-ingest"));
 }
 
 #[test]

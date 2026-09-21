@@ -1,3 +1,32 @@
-# Editorial pipeline JIT grants — none needed: no agent requires a real cloud credential (the facts
-# source is reached via the egress allowlist, not a brokered secret). Default-deny.
-grants = []
+# Editorial pipeline JIT grants (ASI03/ASI06).
+#
+# One grant: the agent-ingest principal exchanges its short-lived identity credential for a real,
+# 5-minute STS session scoped to reading exactly one dropped *.txt object under the source bucket's
+# `incoming/` prefix — never a standing role. The inline session policy the extension renders at mint
+# time narrows the (already narrow) per-grant role to `{resource}`, so even a broad role yields a
+# session that can read only the granted prefix. `reads_sensitive` is leg B of the Rule of Two.
+#
+# `<source_bucket>` is substituted at deploy time by the Terraform that also provisions the per-grant
+# role (`role_arn`) and grants the agent role sts:AssumeRole on it. Managed by `aegis jit`.
+
+[[grants]]
+id = "editorial-source-read"
+audience = "editorial-source"
+required_scope = "s3.read"
+max_ttl_secs = 300
+reads_sensitive = true        # leg B — reads the dropped document
+external_effect = false
+forbid_when_trifecta = true
+consequence = "low_reversible"
+
+[grants.provider]
+kind = "sts"
+role_arn = "arn:aws:iam::000000000000:role/aegis-editorial-jit-source-read"
+resource_arns = ["arn:aws:s3:::CHANGEME-source-bucket/incoming/*"]
+# Inline session policy rendered by the extension at mint time; `{resource}` is substituted with the
+# matched object ARN so the session can read only the dropped file under the granted prefix. Written in
+# compact, alphabetically-keyed form (matches Terraform `jsonencode`) so the deploy can swap in the
+# SSE-KMS variant (adds kms:Decrypt on the source CMK) — see modules/aegis-pipeline/jit.tf.
+session_policy_template = """
+{"Statement":[{"Action":["s3:GetObject","s3:GetObjectVersion"],"Effect":"Allow","Resource":"{resource}"}],"Version":"2012-10-17"}
+"""
