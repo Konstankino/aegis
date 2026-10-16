@@ -248,6 +248,12 @@ ingress guard is valuable but explicitly **not** trusted to be sufficient on its
 For each entry: what OWASP considers achievable, the Aegis controls, the honest
 contain/reduce/process split, and priority.
 
+**Numbering:** this section follows the **OWASP Top 10 for LLM Applications 2025** codes and
+order — the same identifiers the authoritative `aegis_core::Owasp` enum and the generated
+`docs/owasp-coverage-matrix.md` use. (An earlier draft of this section used a different
+ordering; it was reconciled to the 2025 list so the prose, the enum, and the generated
+matrix agree.)
+
 ### LLM01 — Prompt Injection
 - **OWASP:** intrinsic; no reliable prevention exists.
 - **Aegis:** ◐ at input (`aegis-ingress` deterministic Unicode hygiene = strip tag-block
@@ -269,7 +275,29 @@ contain/reduce/process split, and priority.
 - **Residual ○:** side channels (padding/batching helps ◐) and memorization/inversion
   (DP-SGD, dedup, unlearning, encoder vetting — pipeline, not Rust).
 
-### LLM03 — Excessive Agency (the keystone)
+### LLM03 — Supply Chain
+- **`aegis-supply` (●):** sign + hash verify (Sigstore); pin to immutable digests (reject
+  `latest`; detect namespace reuse); SBOM/AIBOM (CycloneDX ML-BOM) gating; serialization
+  scanning + AI-suggested-dependency verification (defeats slopsquatting).
+- **Residual ○:** behavioral backdoors that survive signing → red-teaming + evaluation.
+
+### LLM04 — Data and Model Poisoning
+- **Aegis:** `aegis-supply` artifact integrity (weights, adapters, chat templates, tokenizer
+  configs) ●; `aegis-retrieval` RAG-corpus containment (provenance tags, trust-tier
+  segregation, retrieval-hijack detection) ●/◐; `aegis-ledger` memory-write gating ●.
+- **Residual ○:** training-data poisoning (~250 poisoned docs can backdoor a model
+  regardless of dataset size; alignment does not remove backdoors) → data governance, lineage
+  (DVC), curation, post-alignment trigger-probing.
+
+### LLM05 — Improper Output Handling
+- Textbook **● Contain** and one of Rust's strongest fits.
+- **`aegis-output`:** strict schema validation in trusted code (never a second LLM call);
+  context-aware sink encoding (HTML/SQL/shell/path/email); control-char/ANSI/OSC/BEL
+  stripping for terminal/log/IDE sinks; render-time exfil neutralization (disable auto-fetch
+  of markdown images/link previews/iframes; allowlist or server-side fetch that strips
+  data-bearing query params); no auto-exec of generated code.
+
+### LLM06 — Excessive Agency (the keystone)
 - Root causes: excessive functionality, permissions, autonomy — all deterministic to fix.
 - **`aegis-broker` (●):** complete mediation (no path from model output to a side effect
   skips it; authorization decided in code, never by asking the model); least privilege per
@@ -281,41 +309,13 @@ contain/reduce/process split, and priority.
   core; policies versioned in S3, evaluated locally.
 - **Priority: #1. Build first.**
 
-### LLM04 — Supply Chain
-- **`aegis-supply` (●):** sign + hash verify (Sigstore); pin to immutable digests (reject
-  `latest`; detect namespace reuse); SBOM/AIBOM (CycloneDX ML-BOM) gating; serialization
-  scanning + AI-suggested-dependency verification (defeats slopsquatting).
-- **Residual ○:** behavioral backdoors that survive signing → red-teaming + evaluation.
-
-### LLM05 — Data and Model Poisoning
-- **Aegis:** `aegis-supply` artifact integrity (weights, adapters, chat templates, tokenizer
-  configs) ●; `aegis-retrieval` RAG-corpus containment (provenance tags, trust-tier
-  segregation, retrieval-hijack detection) ●/◐; `aegis-ledger` memory-write gating ●.
-- **Residual ○:** training-data poisoning (~250 poisoned docs can backdoor a model
-  regardless of dataset size; alignment does not remove backdoors) → data governance, lineage
-  (DVC), curation, post-alignment trigger-probing.
-
-### LLM06 — Unbounded Consumption
-- **`aegis-meter` (●):** token-aware limits (tokens/min, tokens/day, est-cost/request) with
-  pre-flight token estimation (HF `tokenizers`, Rust-native) that rejects before inference;
-  **hard spending caps** (non-overridable, halt inference — not just alarms); agentic circuit
-  breakers (step/recursion/wall-clock/cost ceilings; state-hashing loop detection);
-  growing-context guard (per-session cumulative cost); extraction throttling (◐).
-
-### LLM07 — Misinformation
-- **Aegis:** `aegis-broker` claim-check-act — separate generation from execution; re-validate
-  args/authorization/preconditions/state before high-impact tool calls (●); `aegis-output`
-  mandatory structured fields (●).
-- **Residual ○:** factual accuracy / grounding is model/RAG quality — Aegis limits blast
-  radius, doesn't raise accuracy.
-
-### LLM08 — Hidden Context Exposure
+### LLM07 — System Prompt Leakage
 - Fix is almost entirely **architectural** (● by design): no secrets in the prompt/hidden
   context (`aegis-broker`/`aegis-redact`); authorization enforced deterministically by the
   broker, never delegated to system-prompt instructions; hidden context treated as
   non-secret by policy so disclosure has little direct impact.
 
-### LLM09 — Vector and Embedding Weaknesses
+### LLM08 — Vector and Embedding Weaknesses
 - Frame: poisoning makes it wrong, inversion makes it leak, jamming makes it silent,
   access-control failure makes it indiscriminate.
 - **`aegis-retrieval`:** authorization **inside** the index query (● — a client-supplied
@@ -325,30 +325,36 @@ contain/reduce/process split, and priority.
   source sensitivity, classify an "embeddings-only" leak as a source-document breach because
   inversion recovers text) ●/○.
 
-### LLM10 — Improper Output Handling
-- Textbook **● Contain** and one of Rust's strongest fits.
-- **`aegis-output`:** strict schema validation in trusted code (never a second LLM call);
-  context-aware sink encoding (HTML/SQL/shell/path/email); control-char/ANSI/OSC/BEL
-  stripping for terminal/log/IDE sinks; render-time exfil neutralization (disable auto-fetch
-  of markdown images/link previews/iframes; allowlist or server-side fetch that strips
-  data-bearing query params); no auto-exec of generated code.
+### LLM09 — Misinformation
+- **Aegis:** `aegis-broker` claim-check-act — separate generation from execution; re-validate
+  args/authorization/preconditions/state before high-impact tool calls (●); `aegis-output`
+  mandatory structured fields (●).
+- **Residual ○:** factual accuracy / grounding is model/RAG quality — Aegis limits blast
+  radius, doesn't raise accuracy.
+
+### LLM10 — Unbounded Consumption
+- **`aegis-meter` (●):** token-aware limits (tokens/min, tokens/day, est-cost/request) with
+  pre-flight token estimation (HF `tokenizers`, Rust-native) that rejects before inference;
+  **hard spending caps** (non-overridable, halt inference — not just alarms); agentic circuit
+  breakers (step/recursion/wall-clock/cost ceilings; state-hashing loop detection);
+  growing-context guard (per-session cumulative cost); extraction throttling (◐).
 
 ### Coverage matrix (● contain / ◐ reduce / ○ process residual)
 
-| OWASP 2026 | Primary crate(s) | Tier |
+| OWASP LLM (2025) | Primary crate(s) | Tier |
 |---|---|---|
 | LLM01 Prompt Injection | broker, egress, output (contain); ingress (reduce) | ●/◐ |
 | LLM02 Sensitive Info Disclosure | redact, egress, broker, retrieval | ●/◐/○ |
-| LLM03 Excessive Agency | broker | ● |
-| LLM04 Supply Chain | supply | ● |
-| LLM05 Data & Model Poisoning | supply, retrieval, ledger | ●/○ |
-| LLM06 Unbounded Consumption | meter, egress | ● |
-| LLM07 Misinformation | broker, output | ●/○ |
-| LLM08 Hidden Context Exposure | broker, redact | ● |
-| LLM09 Vector & Embedding | retrieval, ingress | ●/◐ |
-| LLM10 Improper Output Handling | output | ● |
+| LLM03 Supply Chain | supply | ● |
+| LLM04 Data & Model Poisoning | supply, retrieval, ledger | ●/○ |
+| LLM05 Improper Output Handling | output | ● |
+| LLM06 Excessive Agency | broker | ● |
+| LLM07 System Prompt Leakage | broker, redact | ● |
+| LLM08 Vector & Embedding | retrieval, ingress | ●/◐ |
+| LLM09 Misinformation | broker, output | ●/○ |
+| LLM10 Unbounded Consumption | meter, egress | ● |
 
-**Read-off:** the entries Aegis contains outright (LLM03, 04, 06, 08, 10) are the
+**Read-off:** the entries Aegis contains outright (LLM03, 05, 06, 07, 10) are the
 consequence- and infrastructure-side ones, and they make the reduce-tier and process-tier
 residuals survivable. **Build the ● column first.**
 
@@ -871,7 +877,98 @@ partially) is maintained in the companion file **`crate-coverage-matrix.md`**.
 
 ---
 
-## 12. Open next step (proposed, not yet done)
+## 12. OWASP Agentic Skills (AST) Top 10 — coverage and Aegis mapping
+
+### 12.0 Why this is a third, companion list
+
+The **OWASP Agentic Skills Top 10** (AST01–AST10, **v1.0 2026 Edition**) is a separate OWASP GenAI
+list from the LLM Top 10 (§3) and the Agentic Applications / ASI Top 10 (§11). It is scoped to the
+**security of agent *skills*** — packaged, dynamically-loaded units of agent capability: how they are
+authored, pinned, scanned, scoped, isolated, updated, governed, and reused across platforms. It is
+mapped here **independently** of the other two lists: where an Aegis crate already covers an LLM/ASI
+risk, its AST role is a *distinct* skill-lifecycle contribution, and the overlaps are called out
+rather than reused as a single mapping.
+
+> **Edition caveat.** AST v1.0 is in OWASP **public review / pre-release** at the time of mapping; the
+> item wording may shift before the list is finalized. The identifiers and titles used here follow the
+> published v1.0 (2026) draft.
+
+### 12.1 Threat-by-threat (AST01–AST10)
+
+The deterministic home for skill verification is `aegis-supply::verify_skill` (`SkillManifest` +
+`SkillContext`), which reuses the existing supply primitives and adds the skill-lifecycle checks.
+
+- **AST01 — Malicious Skills** — ● skills are pinned + scan-attested before activation
+  (`aegis-supply::verify_skill`), execution is sandboxed (`aegis-sandbox`), and decoy tripwires
+  (`aegis-honeypot`) fire on malicious probing. *Overlaps LLM03 / ASI04 (the artifact-integrity
+  machinery), applied to a skill artifact.* *Residual ○:* truly novel malicious logic that passes
+  scan + pin still runs — but only sandboxed and non-root.
+- **AST02 — Supply Chain Compromise** — ● digest pinning, mutable-tag rejection, namespace-reuse
+  detection, SBOM gating (`aegis-supply`). *Direct overlap with LLM03 / LLM04 / ASI04;* the AST view
+  is these controls applied to the *skill* supply chain specifically.
+- **AST03 — Over-Privileged Skills** — ● declared skill permissions are bounded to the host-allowed
+  set at load (`aegis-supply::verify_skill`); every tool call is still mediated (`aegis-broker`
+  Rule-of-Two); delegated credentials can only narrow (`aegis-identity`). *Overlaps LLM06 / ASI03;*
+  the AST delta is the load-time permission-manifest bound.
+- **AST04 — Insecure Metadata** — ● the skill name and every metadata key/value are screened for
+  invisible/bidi/tag smuggling before activation (`aegis-supply::verify_skill` reusing
+  `aegis-ingress::is_clean`). *New skill-lifecycle check; reuses the LLM01/ASI01 ingress screen.*
+- **AST05 — Untrusted External Instructions** — ● skill-sourced content is sanitized and
+  provenance-tainted (`aegis-ingress`), and the broker never lets tainted input drive a privileged
+  action (`aegis-broker` Rule-of-Two), with retrieval injection screening (`aegis-retrieval`).
+  *Direct overlap with LLM01 / ASI01.*
+- **AST06 — Weak Isolation** — ● skills execute only non-root, no-direct-network, path-confined, and
+  after the generation→execution gate (`aegis-sandbox`). *Overlaps ASI05.*
+- **AST07 — Update Drift** — ● only immutable digest skill references load; `:latest` / version-tag
+  drift is rejected and the digest re-checked on each load (`aegis-supply::require_immutable` +
+  `verify_skill`). *Overlaps ASI02 / AST02.*
+- **AST08 — Poor Scanning** — ● a digest-bound **Clean** scan attestation is required before
+  activation; unscanned, flagged, or stale-scan (replayed-from-another-build) skills fail closed
+  (`aegis-supply::ScanAttestation` / `verify_skill`); the red-team suite exercises it. *New
+  skill-lifecycle check.* *Residual ○:* the *quality* of the external scanner is out of scope — Aegis
+  enforces that a current, matching, clean verdict exists, not that the scanner is good.
+- **AST09 — No Governance** — ◐ skill activations land in the tamper-evident ledger
+  (`aegis-ledger`), the kill switch revokes/quarantines a skill (`aegis-killswitch`), and the pinset
+  (`policies/pins.json`) is the governed inventory. *Overlaps ASI09.* *Residual ○:* the governance
+  *program* (review cadence, approval staffing) is process, not code.
+- **AST10 — Cross-Platform Reuse** — ● a skill activates only on a platform it was validated for;
+  cross-platform reuse without re-validation is refused (`aegis-supply::verify_skill` platform
+  binding), with protocol pinning across agents (`aegis-mesh`). *New skill-lifecycle check.*
+
+### 12.2 AST coverage matrix (threat → primary crates)
+
+| AST (v1.0 2026) | Primary Aegis components | Tier | Overlap |
+|---|---|---|---|
+| AST01 Malicious Skills | supply, sandbox, honeypot | ● | LLM03 / ASI04 |
+| AST02 Supply Chain Compromise | supply | ● | LLM03 / LLM04 / ASI04 |
+| AST03 Over-Privileged Skills | supply, broker, identity | ● | LLM06 / ASI03 |
+| AST04 Insecure Metadata | supply, ingress | ● | LLM01 ingress screen |
+| AST05 Untrusted External Instructions | ingress, broker, retrieval | ● | LLM01 / ASI01 |
+| AST06 Weak Isolation | sandbox | ● | ASI05 |
+| AST07 Update Drift | supply | ● | ASI02 / AST02 |
+| AST08 Poor Scanning | supply, redteam | ● | — (new) |
+| AST09 No Governance | ledger, killswitch | ◐ | ASI09 |
+| AST10 Cross-Platform Reuse | supply, mesh | ● | ASI07 |
+
+The per-crate view (which crate mitigates which LLM / ASI / AST entries) is in the companion
+**`crate-coverage-matrix.md`**; the generated, test-enforced artifact is
+**`docs/owasp-coverage-matrix.md`** (every one of the 30 LLM+ASI+AST risks has a covering crate, or
+`aegis-redteam`'s `coverage_matrix_covers_every_owasp_risk` test fails the build).
+
+### 12.3 AST residuals (○) and recommendations
+
+- **Scanner quality (AST08)** — Aegis enforces that a current, digest-matching, Clean scan exists;
+  the semantic/behavioral *depth* of that scan is the external scanner's job. *Recommendation:* wire
+  a real multi-tool skill scanner (static + behavioral) to emit the `ScanAttestation` Aegis requires.
+- **Governance program (AST09)** — the enforcement substrate (inventory, immutable audit, revocation,
+  per-skill identity) is deterministic; the review cadence and approval staffing are process. *See
+  §6 / §11.4 residuals.*
+- **Skill-registry signing (AST01/AST02)** — digest pinning is the deterministic backstop today;
+  cryptographic skill-package signing (Sigstore) is the same future layer noted for LLM03.
+
+---
+
+## 13. Open next step (proposed, not yet done)
 
 Scaffold the actual **`aegis` Rust workspace** as a single zip: `aegis-core` types, a working
 `aegis-broker` skeleton with Cedar wired in, and stubs for the remaining crates — matching the
