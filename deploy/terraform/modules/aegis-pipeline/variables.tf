@@ -115,6 +115,46 @@ variable "runner_security_group_ids" {
   default = []
 }
 
+# ── Entry points ──────────────────────────────────────────────────────────────────────────────────
+# The synchronous HTTP front door (API Gateway: POST /chat, GET /status → start Lambda). Optional so a
+# pipeline can be made event-driven only (e.g. the editorial pipeline is S3-ingestion-only). When off,
+# no API Gateway, start Lambda, or its IAM role are created; the pipeline is triggered only by whatever
+# other entry it defines (e.g. the S3 file-drop EventBridge rule).
+variable "enable_http_entry" {
+  description = "Create the HTTP API front door (POST /chat, GET /status). Set false for an event-driven-only pipeline."
+  type        = bool
+  default     = true
+}
+
+# ── S3 file-drop ingestion (optional) ────────────────────────────────────────────────────────────
+# When source_bucket is set, an EventBridge rule fires on every *.txt dropped under source_prefix and
+# starts an execution; the agent-ingest principal then reads that object with a SHORT-LIVED,
+# object-scoped credential minted by the JIT broker (never a standing role). Empty = feature off, no
+# EventBridge/JIT resources are created and existing deployments are unchanged.
+variable "source_bucket" {
+  description = "Name of an EXISTING S3 bucket to watch for dropped *.txt files. Empty disables the feature."
+  type        = string
+  default     = ""
+}
+
+variable "source_prefix" {
+  description = "Key prefix under source_bucket to watch and to scope the JIT read credential to (least-privilege)."
+  type        = string
+  default     = "incoming/"
+}
+
+variable "source_kms_key_arn" {
+  description = "CMK ARN that encrypts objects in source_bucket, if any. Empty = SSE-S3 (no extra kms:Decrypt granted)."
+  type        = string
+  default     = ""
+}
+
+variable "manage_source_bucket_notifications" {
+  description = "When true, this module enables EventBridge notifications on source_bucket. Set false if the bucket's notification config is managed elsewhere (it must already have EventBridge enabled)."
+  type        = bool
+  default     = true
+}
+
 # ── Code runner (ASI05) ─────────────────────────────────────────────────────────────────────────
 variable "enable_code_runner" {
   description = "Deploy the isolated code-runner Lambda and grant the agent lambda:InvokeFunction on it."

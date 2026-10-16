@@ -47,6 +47,11 @@ resource "aws_lambda_function" "agent" {
       var.enable_code_runner ? {
         AEGIS_RUNNER_FUNCTION = aws_lambda_function.runner[0].function_name
       } : {},
+      # S3 file-drop ingestion: the ExternalId the agent passes when the JIT broker assumes the
+      # per-grant source-read role (must match that role's trust policy). Set only when enabled.
+      local.source_enabled ? {
+        AEGIS_JIT_EXTERNAL_ID = local.jit_external_id
+      } : {},
       # Only export OTLP when a collector layer is attached; otherwise the extension logs only.
       var.otel_collector_layer_arn != "" ? {
         OTEL_EXPORTER_OTLP_ENDPOINT = "http://localhost:4317"
@@ -72,8 +77,9 @@ resource "aws_lambda_function" "agent" {
   ]
 }
 
-# ── Start (API front door). ─────────────────────────────────────────────────────────────────────
+# ── Start (API front door). Only when the HTTP entry is enabled. ────────────────────────────────
 resource "aws_cloudwatch_log_group" "start" {
+  count             = var.enable_http_entry ? 1 : 0
   name              = "/aws/lambda/${local.name}-start"
   retention_in_days = var.log_retention_days
   kms_key_id        = var.kms_key_arn
@@ -81,8 +87,9 @@ resource "aws_cloudwatch_log_group" "start" {
 }
 
 resource "aws_lambda_function" "start" {
+  count         = var.enable_http_entry ? 1 : 0
   function_name = "${local.name}-start"
-  role          = aws_iam_role.start.arn
+  role          = aws_iam_role.start[0].arn
   runtime       = var.python_runtime
   handler       = "start.handler"
   architectures = [var.architecture]

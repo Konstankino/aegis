@@ -83,5 +83,25 @@ class DenyPathTest(unittest.TestCase):
         self.assertEqual(out, {"output": "He goes to the store."})  # stage still completed
 
 
+class FileSeedTest(unittest.TestCase):
+    def test_run_from_file_feeds_the_chain(self):
+        import os
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+            f.write("he go to the stor")
+            path = f.name
+        try:
+            final, stages, trace = R.run_from_file(R.MockConverse(), path)
+            self.assertTrue(final)
+            # The offline file seed drives the same A -> B -> C chain as text input.
+            self.assertEqual(
+                [a for a, _, v, _ in trace if v == "allow"][:2],
+                ["agent-a", "agent-a"],
+            )
+            self.assertIn("candidates", stages["b"])
+        finally:
+            os.unlink(path)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2,7 +2,7 @@
 
 - **Date:** 2026-09-12
 - **Status:** Implemented (green)
-- **Plan:** `~/.claude/plans/given-the-file-architecture-consideratio-replicated-lamport.md`
+- **Plan:** internal planning note (architecture-considerations, JIT credentials)
 - **Type:** New feature (new crate + extension wiring + policy artifact + CLI + Terraform + docs)
 
 ## What & why

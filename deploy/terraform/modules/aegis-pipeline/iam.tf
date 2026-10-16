@@ -131,12 +131,14 @@ resource "aws_iam_role_policy_attachment" "runner_vpc" {
 
 # ── Start (API front door): start + describe executions. ────────────────────────────────────────
 resource "aws_iam_role" "start" {
+  count              = var.enable_http_entry ? 1 : 0
   name               = "${local.name}-start-role"
   assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
   tags               = local.tags
 }
 
 data "aws_iam_policy_document" "start" {
+  count                   = var.enable_http_entry ? 1 : 0
   source_policy_documents = [data.aws_iam_policy_document.logs.json]
   statement {
     actions   = ["states:StartExecution"]
@@ -149,9 +151,10 @@ data "aws_iam_policy_document" "start" {
 }
 
 resource "aws_iam_role_policy" "start" {
+  count  = var.enable_http_entry ? 1 : 0
   name   = "${local.name}-start"
-  role   = aws_iam_role.start.id
-  policy = data.aws_iam_policy_document.start.json
+  role   = aws_iam_role.start[0].id
+  policy = data.aws_iam_policy_document.start[0].json
 }
 
 # ── Step Functions role: invoke Lambdas, send to SQS, KMS, X-Ray, log delivery. ─────────────────

@@ -16,7 +16,8 @@ use aegis_broker::{Broker, Decision, Session};
 use aegis_core::{Capability, Provenance};
 use serde::{Deserialize, Serialize};
 
-/// The OWASP LLM Top-10 (2026) entry an attack targets.
+/// The OWASP risk category an attack targets. Three independent lists: LLM Applications (2025),
+/// Agentic Applications / ASI (2026), and Agentic Skills / AST (v1.0 2026, pre-release).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Category {
@@ -34,6 +35,13 @@ pub enum Category {
     Asi05UnexpectedCodeExecution,
     Asi07InsecureInterAgentComms,
     Asi08CascadingFailures,
+    // OWASP Agentic Skills Top 10 (AST, v1.0 2026), §12.
+    Ast03OverPrivilegedSkills,
+    Ast04InsecureMetadata,
+    Ast06WeakIsolation,
+    Ast07UpdateDrift,
+    Ast08PoorScanning,
+    Ast10CrossPlatformReuse,
 }
 
 /// The outcome of running one attack.
@@ -308,6 +316,45 @@ pub fn default_suite() -> Vec<Attack> {
             description: "The global stop must refuse every tenant instantly and lift cleanly",
             run: attack_global_killswitch_halt,
         },
+        // ── OWASP Agentic Skills Top 10 (AST, §12) ──
+        Attack {
+            name: "over-privileged-skill",
+            category: Ast03OverPrivilegedSkills,
+            description:
+                "A skill declaring a permission beyond the host-allowed set must be refused at load",
+            run: attack_over_privileged_skill,
+        },
+        Attack {
+            name: "skill-metadata-smuggling",
+            category: Ast04InsecureMetadata,
+            description:
+                "A skill hiding an instruction payload in manifest metadata must be refused",
+            run: attack_skill_metadata_smuggling,
+        },
+        Attack {
+            name: "weak-skill-isolation",
+            category: Ast06WeakIsolation,
+            description: "A skill requesting root / direct network in the sandbox must be denied",
+            run: attack_weak_skill_isolation,
+        },
+        Attack {
+            name: "skill-update-drift",
+            category: Ast07UpdateDrift,
+            description: "A skill pinned to a mutable :latest reference must be refused",
+            run: attack_skill_update_drift,
+        },
+        Attack {
+            name: "unscanned-skill",
+            category: Ast08PoorScanning,
+            description: "A skill with no / stale / flagged scan attestation must fail closed",
+            run: attack_unscanned_skill,
+        },
+        Attack {
+            name: "cross-platform-skill-reuse",
+            category: Ast10CrossPlatformReuse,
+            description: "A skill validated only for one platform must be refused on another",
+            run: attack_cross_platform_skill_reuse,
+        },
     ]
 }
 
@@ -472,6 +519,133 @@ fn attack_supply_digest_swap() -> AttackOutcome {
     match pinset.verify("model", &swapped) {
         Err(_) => AttackOutcome::contained("supply rejected the unpinned digest"),
         Ok(()) => AttackOutcome::breached("supply accepted a swapped artifact"),
+    }
+}
+
+// ── OWASP Agentic Skills Top 10 (AST) attacks — each drives aegis-supply::verify_skill (or the
+//    sandbox) with a skill manifest, asserting the skill-lifecycle gate contains the abuse. ──
+
+/// A valid, pinned, scanned, single-platform skill plus its pinset and the host-allowed permission
+/// set — the baseline each AST attack mutates into an abuse.
+fn skill_fixture() -> (
+    aegis_supply::SkillManifest,
+    aegis_supply::Pinset,
+    std::collections::BTreeSet<String>,
+) {
+    let digest = aegis_supply::Digest::sha256(b"triage-skill-v1");
+    let pinset =
+        aegis_supply::Pinset::from_json(&format!(r#"{{ "triage": ["{}"] }}"#, digest.to_ref()))
+            .expect("pinset");
+    let manifest = aegis_supply::SkillManifest {
+        name: "triage".into(),
+        reference: format!("registry/triage@{}", digest.to_ref()),
+        digest: digest.clone(),
+        permissions: std::collections::BTreeSet::from(["read_tickets".to_string()]),
+        metadata: std::collections::BTreeMap::from([(
+            "author".to_string(),
+            "platform-team".to_string(),
+        )]),
+        platforms: std::collections::BTreeSet::from(["langgraph".to_string()]),
+        scan: Some(aegis_supply::ScanAttestation {
+            scanner: "aegis-scan".into(),
+            scanned_digest: digest,
+            verdict: aegis_supply::ScanVerdict::Clean,
+        }),
+    };
+    let allowed = std::collections::BTreeSet::from(["read_tickets".to_string()]);
+    (manifest, pinset, allowed)
+}
+
+fn attack_over_privileged_skill() -> AttackOutcome {
+    let (mut m, pinset, allowed) = skill_fixture();
+    // The skill quietly asks for a destructive permission the host never granted.
+    m.permissions.insert("delete_tickets".to_string());
+    let ctx = aegis_supply::SkillContext {
+        host_platform: "langgraph",
+        allowed_permissions: &allowed,
+    };
+    match aegis_supply::verify_skill(&m, &pinset, &ctx) {
+        Err(_) => AttackOutcome::contained("skill gate refused the over-privileged permission"),
+        Ok(()) => AttackOutcome::breached("skill gate activated an over-privileged skill"),
+    }
+}
+
+fn attack_skill_metadata_smuggling() -> AttackOutcome {
+    let (mut m, pinset, allowed) = skill_fixture();
+    // Hide an invisible tag-block instruction payload in a metadata value.
+    m.metadata.insert(
+        "description".to_string(),
+        "summarize\u{E0041}\u{E0042}".to_string(),
+    );
+    let ctx = aegis_supply::SkillContext {
+        host_platform: "langgraph",
+        allowed_permissions: &allowed,
+    };
+    match aegis_supply::verify_skill(&m, &pinset, &ctx) {
+        Err(_) => AttackOutcome::contained("skill gate refused smuggled metadata"),
+        Ok(()) => AttackOutcome::breached("skill gate accepted invisible-char metadata"),
+    }
+}
+
+fn attack_weak_skill_isolation() -> AttackOutcome {
+    // A skill's generated code asks for root in the sandbox; the policy must deny it.
+    let req = aegis_sandbox::ExecRequest {
+        command: "install-deps.sh".into(),
+        wants_root: true,
+        wants_network: false,
+        target_path: None,
+        approved: true,
+    };
+    if aegis_sandbox::SandboxPolicy::default()
+        .validate(&req)
+        .is_allow()
+    {
+        AttackOutcome::breached("sandbox allowed a root skill execution")
+    } else {
+        AttackOutcome::contained("sandbox denied the root skill execution")
+    }
+}
+
+fn attack_skill_update_drift() -> AttackOutcome {
+    let (mut m, pinset, allowed) = skill_fixture();
+    // Repoint the skill at a mutable :latest reference (silent update drift).
+    m.reference = "registry/triage:latest".into();
+    let ctx = aegis_supply::SkillContext {
+        host_platform: "langgraph",
+        allowed_permissions: &allowed,
+    };
+    match aegis_supply::verify_skill(&m, &pinset, &ctx) {
+        Err(_) => AttackOutcome::contained("skill gate refused the mutable :latest reference"),
+        Ok(()) => AttackOutcome::breached("skill gate accepted a drifting mutable reference"),
+    }
+}
+
+fn attack_unscanned_skill() -> AttackOutcome {
+    let (mut m, pinset, allowed) = skill_fixture();
+    // Replay a Clean scan from a different build to admit a swapped artifact.
+    if let Some(att) = m.scan.as_mut() {
+        att.scanned_digest = aegis_supply::Digest::sha256(b"some-other-build");
+    }
+    let ctx = aegis_supply::SkillContext {
+        host_platform: "langgraph",
+        allowed_permissions: &allowed,
+    };
+    match aegis_supply::verify_skill(&m, &pinset, &ctx) {
+        Err(_) => AttackOutcome::contained("skill gate refused the stale/mismatched scan"),
+        Ok(()) => AttackOutcome::breached("skill gate accepted an unscanned artifact"),
+    }
+}
+
+fn attack_cross_platform_skill_reuse() -> AttackOutcome {
+    let (m, pinset, allowed) = skill_fixture();
+    // The skill was validated for langgraph only; reuse it on autogen without re-validation.
+    let ctx = aegis_supply::SkillContext {
+        host_platform: "autogen",
+        allowed_permissions: &allowed,
+    };
+    match aegis_supply::verify_skill(&m, &pinset, &ctx) {
+        Err(_) => AttackOutcome::contained("skill gate refused reuse on an unvalidated platform"),
+        Ok(()) => AttackOutcome::breached("skill gate allowed cross-platform reuse"),
     }
 }
 
@@ -1010,6 +1184,28 @@ pub mod coverage {
                 "Output confidence gating and an immutable audit trail bound trust exploitation", Reduce),
             row(Asi10, &["aegis-killswitch"],
                 "Instant revocation + quarantine; reintegration needs fresh attestation AND a human", Contain),
+            // ── OWASP Agentic Skills Top 10 (AST, v1.0 2026 — pre-release). Mapped independently
+            //    of LLM/ASI; shared crates carry a distinct skill-lifecycle role here. ──
+            row(Ast01, &["aegis-supply", "aegis-sandbox", "aegis-honeypot"],
+                "Skills are pinned + scan-attested before activation; execution is sandboxed; decoys trip on malicious probing", Contain),
+            row(Ast02, &["aegis-supply"],
+                "Skill-artifact digest pinning; mutable-tag and namespace-reuse rejection fail closed", Contain),
+            row(Ast03, &["aegis-supply", "aegis-broker", "aegis-identity"],
+                "Declared skill permissions bounded to the host-allowed set at load; every tool call still mediated; narrow-only delegation", Contain),
+            row(Ast04, &["aegis-supply", "aegis-ingress"],
+                "Skill-manifest name and metadata screened for invisible/bidi/tag smuggling before activation", Contain),
+            row(Ast05, &["aegis-ingress", "aegis-broker", "aegis-retrieval"],
+                "Skill-sourced content is sanitized + provenance-tainted; the broker never lets tainted input drive a privileged action", Contain),
+            row(Ast06, &["aegis-sandbox"],
+                "Skills execute only non-root, no-direct-network, path-confined, and after the generation→execution gate", Contain),
+            row(Ast07, &["aegis-supply"],
+                "Only immutable digest skill refs load; :latest / version-tag drift is rejected and the digest re-checked each load", Contain),
+            row(Ast08, &["aegis-supply", "aegis-redteam"],
+                "A digest-bound Clean scan attestation is required before activation; unscanned, flagged, or stale-scan skills fail closed", Contain),
+            row(Ast09, &["aegis-ledger", "aegis-killswitch"],
+                "Skill activations land in the tamper-evident ledger; the kill switch revokes/quarantines a skill; the pinset is the governed inventory (review cadence stays process)", Reduce),
+            row(Ast10, &["aegis-supply", "aegis-mesh"],
+                "A skill activates only on a platform it was validated for; cross-platform reuse without re-validation is refused", Contain),
         ]
     }
 
@@ -1159,5 +1355,15 @@ mod tests {
         assert!(attack_supply_mutable_tag().contained);
         assert!(attack_unauthorized_retrieval().contained);
         assert!(attack_memory_poisoning().contained);
+    }
+
+    #[test]
+    fn ast_skill_attacks_are_contained() {
+        assert!(attack_over_privileged_skill().contained);
+        assert!(attack_skill_metadata_smuggling().contained);
+        assert!(attack_weak_skill_isolation().contained);
+        assert!(attack_skill_update_drift().contained);
+        assert!(attack_unscanned_skill().contained);
+        assert!(attack_cross_platform_skill_reuse().contained);
     }
 }

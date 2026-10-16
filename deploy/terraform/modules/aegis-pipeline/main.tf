@@ -19,7 +19,8 @@ locals {
     "meter.toml"            = "${var.policy_dir}/meter.toml"
     "pins.json"             = "${var.policy_dir}/pins.json"
     "sandbox.toml"          = "${var.policy_dir}/sandbox.toml"
-    "grants.toml"           = "${var.policy_dir}/grants.toml"
+    # NOTE: grants.toml is uploaded separately (see jit.tf) so its role/resource ARNs can be rendered
+    # from the per-grant IAM role at deploy time (or emptied to default-deny when the feature is off).
     # Per-pipeline honeypot decoys/canaries (ASI05/ASI08). Fetched from S3 at cold start so each
     # pipeline has its own set; the layer-baked honeypots.json is the shared fallback.
     "honeypots.json" = "${var.policy_dir}/honeypots.json"

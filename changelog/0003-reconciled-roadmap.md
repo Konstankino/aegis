@@ -3,7 +3,7 @@
 - **Date:** 2026-09-14
 - **Status:** Delivered (planning artifact)
 - **Type:** Roadmap / planning
-- **Artifact:** https://claude.ai/code/artifact/2f27f00a-5f22-469a-a8ed-9cd70eb06de0
+- **Artifact:** external 22-week build-plan artifact (shared by the user)
 
 ## What & why
 

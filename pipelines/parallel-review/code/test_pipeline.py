@@ -228,7 +228,9 @@ class EngineEndToEndTest(unittest.TestCase):
 
     def test_a_worker_may_not_publish(self):
         # A peer writer is not the referee: the broker denies publish.final even if the model tries.
-        self.assertEqual(self.agent.profile_for("agent-b")["terminal"], {"submit.candidate": ("output", "text")})
+        # The terminal tuple carries (output_key, arg_key, source); "args" is the default source.
+        self.assertEqual(self.agent.profile_for("agent-b")["terminal"],
+                         {"submit.candidate": ("output", "text", "args")})
         self.assertNotIn("publish_final",
                          {t["toolSpec"]["name"] for t in self.agent.profile_for("agent-b")["tools"]})
 

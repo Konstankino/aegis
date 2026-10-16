@@ -359,8 +359,11 @@ impl PolicyDecision {
 // ── OWASP risk identifiers (Roadmap T0) ───────────────────────────────────────────────────────────
 
 /// The OWASP risk identifiers the plane maps to — typed, not magic strings, so errors, spans, and
-/// the coverage matrix are searchable by risk category. `LLM01..LLM10` (OWASP Top-10 for LLM
-/// Applications) and `ASI01..ASI10` (OWASP Top-10 for Agentic Applications).
+/// the coverage matrix are searchable by risk category. Three separate OWASP GenAI lists:
+/// `LLM01..LLM10` (OWASP Top-10 for LLM Applications, 2025), `ASI01..ASI10` (OWASP Top-10 for
+/// Agentic Applications / Agentic Security Initiative, 2026), and `AST01..AST10` (OWASP Agentic
+/// Skills Top 10, v1.0 2026 — public-review/pre-release at time of mapping). The lists are mapped
+/// independently; a control covering a risk in one list does not count for another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Owasp {
@@ -384,11 +387,21 @@ pub enum Owasp {
     Asi08,
     Asi09,
     Asi10,
+    Ast01,
+    Ast02,
+    Ast03,
+    Ast04,
+    Ast05,
+    Ast06,
+    Ast07,
+    Ast08,
+    Ast09,
+    Ast10,
 }
 
 impl Owasp {
     /// Every risk id, in order — for building the coverage matrix.
-    pub const ALL: [Owasp; 20] = [
+    pub const ALL: [Owasp; 30] = [
         Owasp::Llm01,
         Owasp::Llm02,
         Owasp::Llm03,
@@ -409,6 +422,16 @@ impl Owasp {
         Owasp::Asi08,
         Owasp::Asi09,
         Owasp::Asi10,
+        Owasp::Ast01,
+        Owasp::Ast02,
+        Owasp::Ast03,
+        Owasp::Ast04,
+        Owasp::Ast05,
+        Owasp::Ast06,
+        Owasp::Ast07,
+        Owasp::Ast08,
+        Owasp::Ast09,
+        Owasp::Ast10,
     ];
 
     /// The canonical code, e.g. `"LLM06"` or `"ASI03"`.
@@ -435,6 +458,16 @@ impl Owasp {
             Owasp::Asi08 => "ASI08",
             Owasp::Asi09 => "ASI09",
             Owasp::Asi10 => "ASI10",
+            Owasp::Ast01 => "AST01",
+            Owasp::Ast02 => "AST02",
+            Owasp::Ast03 => "AST03",
+            Owasp::Ast04 => "AST04",
+            Owasp::Ast05 => "AST05",
+            Owasp::Ast06 => "AST06",
+            Owasp::Ast07 => "AST07",
+            Owasp::Ast08 => "AST08",
+            Owasp::Ast09 => "AST09",
+            Owasp::Ast10 => "AST10",
         }
     }
 
@@ -462,6 +495,16 @@ impl Owasp {
             Owasp::Asi08 => "Cascading failures",
             Owasp::Asi09 => "Human-agent trust exploitation",
             Owasp::Asi10 => "Rogue agents",
+            Owasp::Ast01 => "Malicious skills",
+            Owasp::Ast02 => "Supply-chain compromise",
+            Owasp::Ast03 => "Over-privileged skills",
+            Owasp::Ast04 => "Insecure metadata",
+            Owasp::Ast05 => "Untrusted external instructions",
+            Owasp::Ast06 => "Weak isolation",
+            Owasp::Ast07 => "Update drift",
+            Owasp::Ast08 => "Poor scanning",
+            Owasp::Ast09 => "No governance",
+            Owasp::Ast10 => "Cross-platform reuse",
         }
     }
 }
@@ -514,8 +557,11 @@ mod t0_tests {
     fn owasp_codes_titles_and_serde() {
         assert_eq!(Owasp::Llm06.code(), "LLM06");
         assert_eq!(Owasp::Asi03.to_string(), "ASI03");
-        assert_eq!(Owasp::ALL.len(), 20);
+        assert_eq!(Owasp::Ast04.code(), "AST04");
+        assert_eq!(Owasp::Ast04.title(), "Insecure metadata");
+        assert_eq!(Owasp::ALL.len(), 30);
         assert_eq!(serde_json::to_string(&Owasp::Asi10).unwrap(), "\"ASI10\"");
+        assert_eq!(serde_json::to_string(&Owasp::Ast01).unwrap(), "\"AST01\"");
         assert_eq!(
             serde_json::from_str::<Owasp>("\"LLM01\"").unwrap(),
             Owasp::Llm01
@@ -528,7 +574,10 @@ mod t0_tests {
         for r in Owasp::ALL {
             let code = r.code();
             assert_eq!(code.len(), 5, "{code} should be 5 chars");
-            assert!(code.starts_with("LLM") || code.starts_with("ASI"), "{code}");
+            assert!(
+                code.starts_with("LLM") || code.starts_with("ASI") || code.starts_with("AST"),
+                "{code}"
+            );
             assert!(!r.title().is_empty(), "{code} has no title");
             assert_eq!(r.to_string(), code);
             let j = serde_json::to_string(&r).unwrap();
@@ -538,7 +587,7 @@ mod t0_tests {
         let mut codes: Vec<&str> = Owasp::ALL.iter().map(Owasp::code).collect();
         codes.sort_unstable();
         codes.dedup();
-        assert_eq!(codes.len(), 20, "all OWASP codes are distinct");
+        assert_eq!(codes.len(), 30, "all OWASP codes are distinct");
     }
 }
 

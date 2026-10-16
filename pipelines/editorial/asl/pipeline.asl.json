@@ -1,14 +1,36 @@
 {
-  "Comment": "Editorial pipeline (Aegis scenario): a linear A -> B -> C chain. There are NO per-agent Lambdas — the SAME agent function is invoked three times with a different agent_id (the Cedar principal). Each invocation mediates every tool call through the Aegis inline-plane gate, which applies the per-agent least-privilege policy (pipelines/editorial/policies/broker.cedar).",
-  "StartAt": "Init",
+  "Comment": "Editorial pipeline (Aegis scenario): S3-ingestion-only. A *.txt dropped in the source bucket starts one execution (input = {source_bucket, source_key}); the agent-ingest stage fetches it with a short-lived, object-scoped JIT credential, then a linear A -> B -> C chain runs. There are NO per-agent Lambdas — the SAME agent function is invoked with a different agent_id (the Cedar principal) each stage, every tool call mediated by the Aegis inline-plane gate (pipelines/editorial/policies/broker.cedar).",
+  "StartAt": "Ingest",
   "States": {
-    "Init": {
-      "Type": "Pass",
-      "Comment": "Seed the run: a thread id correlates the audit ledger + taint across the chain.",
+    "Ingest": {
+      "Type": "Task",
+      "Comment": "Agent ingest (principal agent-ingest): the ONLY entry point. Fetch the dropped *.txt with a SHORT-LIVED, object-scoped credential minted by the JIT broker (/credentials/issue), then hand its text to Agent A. May invoke ONLY source.read (broker-enforced).",
+      "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "thread_id.$": "$$.Execution.Name",
-        "text.$": "$.input"
+        "FunctionName": "${agent_lambda_arn}",
+        "Payload": {
+          "agent_id": "agent-ingest",
+          "run_id.$": "$$.Execution.Name",
+          "thread_id.$": "$$.Execution.Name",
+          "source_bucket.$": "$.source_bucket",
+          "source_key.$": "$.source_key",
+          "source_version_id.$": "$.source_version_id",
+          "source_etag.$": "$.source_etag"
+        }
       },
+      "ResultSelector": {
+        "thread_id.$": "$$.Execution.Name",
+        "text.$": "$.Payload.output"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.TooManyRequestsException", "Lambda.ServiceException", "States.TaskFailed"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "Failed", "ResultPath": "$.error" }],
       "Next": "AgentA_Grammar"
     },
     "AgentA_Grammar": {

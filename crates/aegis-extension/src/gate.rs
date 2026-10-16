@@ -184,6 +184,7 @@ pub fn router_with_emitter(
         .route("/killswitch/status", get(killswitch_status))
         .route("/sandbox/validate", post(sandbox_validate))
         .route("/intent/validate", post(intent_validate))
+        .route("/identity/self", post(identity_self))
         .route("/credentials/issue", post(credentials_issue))
         .route("/output/scan", post(output_scan))
         .with_state(state)
@@ -1179,6 +1180,73 @@ async fn credentials_issue(
             }
         }
     }
+}
+
+/// A request for a short-lived identity credential the co-located agent presents to
+/// `/credentials/issue`. Loopback-only: the caller is the agent process in this same Lambda.
+#[derive(Debug, Deserialize)]
+struct IdentitySelfRequest {
+    agent_id: String,
+    audience: String,
+    scopes: Vec<String>,
+    session_id: String,
+    #[serde(default)]
+    purpose: String,
+    #[serde(default = "default_self_ttl_secs")]
+    ttl_secs: u64,
+}
+
+fn default_self_ttl_secs() -> u64 {
+    300
+}
+
+/// Ceiling on a self-issued identity credential's life (5 min). The JIT broker clamps the minted
+/// cloud credential to this too, so a longer request cannot outlive the identity that authorized it.
+const MAX_SELF_TTL_MS: u64 = 300_000;
+
+/// Derive a 32-byte Ed25519 seed deterministically from the request facts. The trust boundary for
+/// `/credentials/issue` is loopback isolation (the extension shares the agent's execution context),
+/// not a shared secret — `verify` only checks the credential's self-consistency — so a per-call
+/// ephemeral key is safe and keeps any signing key out of the agent process.
+fn ephemeral_seed(parts: &[&str]) -> [u8; 32] {
+    let mut seed = [0u8; 32];
+    for (i, chunk) in seed.chunks_mut(8).enumerate() {
+        let mut h = DefaultHasher::new();
+        i.hash(&mut h);
+        for p in parts {
+            p.hash(&mut h);
+        }
+        chunk.copy_from_slice(&h.finish().to_le_bytes());
+    }
+    seed
+}
+
+/// **Self identity issuance** (loopback): mint a short-lived, signed `aegis-identity` credential for
+/// the co-located principal, so the agent never handles a private key. The credential is bound to the
+/// principal / audience / scope / session it is issued for; `/credentials/issue` then verifies those
+/// against the grant and the request. It grants nothing on its own — the grant catalog + Rule-of-Two
+/// still gate every exchange.
+async fn identity_self(Json(req): Json<IdentitySelfRequest>) -> impl IntoResponse {
+    let now = now_ms();
+    let ttl_ms = req.ttl_secs.saturating_mul(1000).clamp(1, MAX_SELF_TTL_MS);
+    let now_str = now.to_string();
+    let seed = ephemeral_seed(&[&req.agent_id, &req.session_id, &req.audience, &now_str]);
+    let kp = aegis_core::signing::Keypair::from_seed(&seed);
+    let cred = Credential::issue(
+        &kp,
+        req.agent_id,
+        req.audience,
+        req.purpose,
+        req.session_id,
+        "self",
+        req.scopes,
+        now,
+        now + ttl_ms,
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "credential": cred })),
+    )
 }
 
 /// A JIT deny/unavailable response: a fixed non-sensitive reason + status. (No ledger side effect —
@@ -2882,6 +2950,68 @@ mod tests {
             "credential": cred, "grant_id": grant, "requested_ttl_secs": ttl,
             "purpose": PURPOSE
         })
+    }
+
+    #[tokio::test]
+    async fn identity_self_issues_a_credential_the_jit_gate_accepts() {
+        // The co-located agent mints its identity credential over loopback (no private key in the
+        // agent), then exchanges it for a scoped cloud credential. Prove the self-issued credential
+        // passes the whole JIT decision path: in a lean build the mint stub fails closed (502),
+        // which is only reachable AFTER identity verify + grant coherence + the trifecta gate all pass.
+        let app = app_with_grants(vec![read_grant()]);
+        let (status, body) = post(
+            app.clone(),
+            "/identity/self",
+            serde_json::json!({
+                "agent_id": "a", "audience": "patient-db",
+                "scopes": ["db.read"], "session_id": "t1"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let cred = body["credential"].clone();
+        assert!(cred.is_object(), "a signed credential is returned");
+
+        // Exchange it (purpose "" — the self credential carries no purpose, and the request must match).
+        let (status, body) = post(
+            app,
+            "/credentials/issue",
+            serde_json::json!({
+                "agent_id": "a", "run_id": "r", "thread_id": "t1",
+                "credential": cred, "grant_id": "db-read",
+                "requested_ttl_secs": 60, "action_scope": "db.read", "purpose": ""
+            }),
+        )
+        .await;
+        if cfg!(feature = "jit") {
+            assert!(status == StatusCode::OK || status == StatusCode::BAD_GATEWAY);
+        } else {
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(body["reason"], "credential mint failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_self_ttl_is_capped_and_binds_the_request_facts() {
+        // The credential is bound to the principal/audience/scope/session asked for, and its life is
+        // capped at the 5-minute ceiling even when a larger ttl is requested.
+        let (status, body) = post(
+            app(),
+            "/identity/self",
+            serde_json::json!({
+                "agent_id": "agent-ingest", "audience": "editorial-source",
+                "scopes": ["s3.read"], "session_id": "thread-1", "ttl_secs": 100_000
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let cred = &body["credential"];
+        assert_eq!(cred["subject"], "agent-ingest");
+        assert_eq!(cred["audience"], "editorial-source");
+        assert_eq!(cred["session_id"], "thread-1");
+        assert_eq!(cred["scopes"], serde_json::json!(["s3.read"]));
+        let life = cred["expires_at"].as_u64().unwrap() - cred["issued_at"].as_u64().unwrap();
+        assert_eq!(life, MAX_SELF_TTL_MS, "ttl is clamped to the ceiling");
     }
 
     #[tokio::test]

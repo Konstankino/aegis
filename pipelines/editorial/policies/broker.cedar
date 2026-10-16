@@ -5,7 +5,12 @@
 // agent — is refused by the broker deterministically, before any effect.
 //
 // The chain is enforced by which HANDOFF tool each agent may call:
-//   A ──send.to_agent_b──▶ B ──send.to_agent_c──▶ C ──publish.final──▶ out
+//   ingest ──▶ A ──send.to_agent_b──▶ B ──send.to_agent_c──▶ C ──publish.final──▶ out
+
+// ── Agent ingest — S3 file-drop intake: read the dropped *.txt with a short-lived, object-scoped ──
+// credential (JIT broker, /credentials/issue), then hand its text to Agent A. It may invoke ONLY
+// source.read; no other agent may read the source, and ingest may touch nothing in the A/B/C lanes.
+permit ( principal == Agent::"agent-ingest", action == Action::"invoke", resource == Tool::"source.read" );
 
 // ── Agent A — grammar: correct the text, then hand off to Agent B. ────────────────────────────────
 permit ( principal == Agent::"agent-a", action == Action::"invoke", resource == Tool::"grammar.correct" );
